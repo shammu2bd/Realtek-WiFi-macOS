@@ -315,7 +315,7 @@ IOReturn RTL88WiFi::setProperties(OSObject *properties)
 
 bool RTL88WiFi::start(IOService *provider)
 {
-    setProperty("DriverBuild", "1.0.12");
+    setProperty("DriverBuild", "1.0.13");
     setProperty("STA_R10_TXQ_GATE", kOSBooleanTrue);
     setProperty("STA_R11_TXQ_STALL_GATE", kOSBooleanTrue);
     setProperty("STA_R25_TXQ_DEPTH_PER_AC", (uint64_t)kRTW88DataQueueDepth, 32);
@@ -500,6 +500,18 @@ bool RTL88WiFi::start(IOService *provider)
         IOLog("RTL88WiFi: PRIVATE_MAC rotation timer unavailable; Fixed mode remains available\n");
     }
 
+    /* 802.11v acceptance is acted on only after the management TX status
+     * reports an ACK. This short-poll timer runs on the controller workloop
+     * and shares the diagnostics hardware fence used by system-sleep handling. */
+    _roamingTimer = IOTimerEventSource::timerEventSource(this, &RTL88WiFi::roamingTimerFired);
+    if (_roamingTimer && _workLoop->addEventSource(_roamingTimer) == kIOReturnSuccess) {
+        setProperty("ROAMING_CONTROL_TIMER_AVAILABLE", kOSBooleanTrue);
+    } else {
+        if (_roamingTimer) { _roamingTimer->release(); _roamingTimer = nullptr; }
+        setProperty("ROAMING_CONTROL_TIMER_AVAILABLE", kOSBooleanFalse);
+        IOLog("RTL88WiFi: 802.11v BTM ACK timer unavailable; BTM capability will not be advertised\n");
+    }
+
     /* Keep at most one follow-up scan request from a burst while another scan
      * is active. The timer dispatches it after the current scan completes;
      * the IEEE80211 layer also enforces a 15 s connected-scan floor. */
@@ -514,7 +526,7 @@ bool RTL88WiFi::start(IOService *provider)
     } else {
         setProperty("PENDING_SCAN_QUEUE_AVAILABLE", kOSBooleanTrue);
     }
-    IOLog("RTL88WiFi: 1.0.12 diagnostics enabled; fixes=assoc-open-empty-key,private-mac-legacy-and-skywalk-get-set,fixed-rotating-mac,mesh-roam,mesh-cache-refresh,mesh-scan-band-priority,mesh-scan-throttle,pending-scan-coalesce,mesh-scan-phase-telemetry,mesh-rate-reseed-diagnostics,unifi-home-band-candidate-pool,throttle-log-sampling,peer-vht-map-telemetry\n");
+    IOLog("RTL88WiFi: 1.0.13 diagnostics enabled; fixes=assoc-open-empty-key,private-mac-legacy-and-skywalk-get-set,fixed-rotating-mac,mesh-roam,mesh-cache-refresh,mesh-scan-band-priority,mesh-scan-throttle,pending-scan-coalesce,mesh-scan-phase-telemetry,mesh-rate-reseed-diagnostics,unifi-home-band-candidate-pool,throttle-log-sampling,peer-vht-map-telemetry,80211k-neighbor-report,80211v-btm-directed-scan-and-ack-gated-roam\n");
     IOLog("RTL88WiFi: device started successfully\n");
     return true;
 }
@@ -1055,6 +1067,14 @@ void RTL88WiFi::teardown()
     if (_pendingScanLock) {
         IOLockFree(_pendingScanLock);
         _pendingScanLock = nullptr;
+    }
+    if (_roamingTimer) {
+        _roamingTimer->disable();
+        _roamingTimer->cancelTimeout();
+        if (_workLoop) _workLoop->removeEventSource(_roamingTimer);
+        _roamingTimer->cancelTimeout();
+        _roamingTimer->release();
+        _roamingTimer = nullptr;
     }
     if (_privateMacTimer) {
         _privateMacTimer->disable();
@@ -2831,7 +2851,7 @@ __attribute__((__noinline__)) SInt32 RTL88WiFi::handleNativeRequest(
         if (request_number == APPLE80211_IOC_DRIVER_VERSION) {
             char label[sizeof(d->string)] = {};
             strlcpy(label, chip, sizeof(label));
-            strlcat(label, " (RTL88WiFi 1.0.12)", sizeof(label));
+            strlcat(label, " (RTL88WiFi 1.0.13)", sizeof(label));
             d->string_len = (uint16_t)strlcpy(d->string, label, sizeof(d->string));
         } else {
             d->string_len = (uint16_t)strlcpy(d->string, chip, sizeof(d->string));
@@ -3139,6 +3159,50 @@ void RTL88WiFi::privateMacTimerFired(OSObject *owner, IOTimerEventSource *timer)
 
     if (self->_privMacEnabled && self->_privMacIntervalS)
         self->armPrivateMACTimer(self->_privMacIntervalS * 1000U);
+}
+
+bool RTL88WiFi::roamingActionsAllowed() const
+{
+    return !__atomic_load_n(&_shutdown, __ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&_pmTransition, __ATOMIC_SEQ_CST) &&
+        !__atomic_load_n(&_dmaStopped, __ATOMIC_ACQUIRE);
+}
+
+bool RTL88WiFi::roamingControlAvailable() const
+{
+    return _roamingTimer && _workLoop && roamingActionsAllowed();
+}
+
+bool RTL88WiFi::scheduleRoamingControl(unsigned delayMs)
+{
+    if (!roamingControlAvailable() || !delayMs)
+        return false;
+    _roamingTimer->setTimeoutMS(delayMs);
+    /* Recheck after arming: setPowerState may have started a transition while
+     * the timer was being scheduled from the RX/workloop callback. */
+    if (!roamingActionsAllowed()) {
+        _roamingTimer->cancelTimeout();
+        return false;
+    }
+    return true;
+}
+
+void RTL88WiFi::roamingTimerFired(OSObject *owner, IOTimerEventSource *timer)
+{
+    RTL88WiFi *self = OSDynamicCast(RTL88WiFi, owner);
+    if (!self || !timer || self->_shutdown || !self->_ieee80211)
+        return;
+    __atomic_store_n(&self->_diagnosticsInHardware, true, __ATOMIC_SEQ_CST);
+    if (self->roamingActionsAllowed() && self->_ieee80211->isPowered())
+        self->_ieee80211->btmTick();
+    __atomic_store_n(&self->_diagnosticsInHardware, false, __ATOMIC_SEQ_CST);
+
+    if (self->_ieee80211 && self->_ieee80211->btmPending() &&
+        self->roamingActionsAllowed()) {
+        timer->setTimeoutMS(self->_ieee80211->btmPollMS());
+    } else {
+        timer->cancelTimeout();
+    }
 }
 
 

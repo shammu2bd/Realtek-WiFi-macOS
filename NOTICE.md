@@ -25,6 +25,14 @@ three-line change to the vendored `rtw8821c.c` (reading RX SNR), which is why
 the 1.0.0-era "rtw88 source unchanged" statement in `docs/` no longer holds for
 this version.
 
+## Roaming reference code
+
+The 802.11k Neighbor Report / 802.11v BSS Transition wire helper in
+`driver/RTL88WiFi/src/kext/RTW88Roaming.hpp` is adapted from the corresponding
+GPL-2.0-licensed AirPort-RTW source file. The upstream project and adaptation
+scope are recorded in
+`driver/RTL88WiFi/NOTICE-ROAMING-AIRPORT-RTW.md`.
+
 ## Separately licensed parts
 
 - Kernel SDK headers in `driver/RTL88WiFi/MacKernelSDK/` keep their own

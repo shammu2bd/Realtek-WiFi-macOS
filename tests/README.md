@@ -88,3 +88,16 @@ stale, weak and recently failed 5 GHz entries do not trigger a pinned upgrade.
 Commit/Confirm, the production four-way handshake, PMF/replay and CCMP/AES.
 These remain host checks; the selected over-the-air BSSID and 5 GHz band must
 be confirmed on the target Mac.
+
+
+### 802.11k Neighbor Report and 802.11v BSS Transition Management (1.0.13)
+
+`python3 tests/test-rrm-btm.py` compiles the production bounded wire helpers
+with strict warnings and checks AP capability parsing, Neighbor Report
+request/response dialog tokens, malformed IE handling, BTM request/response
+parsing, action-frame addressing, and WPA3 protected-response CCMP-PN receipt
+matching. Source guards verify that capability bits are only advertised for
+supported security paths, WPA3 actions require PMF verification, a BTM
+candidate can be found by a directed connected scan, and the roam handoff is
+held until the matching BTM response TX ACK. This does not emulate CoreWiFi,
+real AP interoperability, PMF hardware encryption or RF roaming.

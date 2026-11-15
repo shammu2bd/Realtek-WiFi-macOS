@@ -25,7 +25,7 @@ assert "connected scan rate-limited events=%u" in IEEE
 assert "_connectedScanThrottleEvents" in (KEXT / "RTW88IEEE80211.hpp").read_text()
 assert "sampled_total=%u" in CTRL
 assert "_pendingScanThrottleDeferrals" in CTRL_H
-assert "1.0.12" in CTRL
+assert "1.0.13" in CTRL
 assert "strong5GHz && txRate.kbps <= RTW88MeshRoam::kLowRateTriggerKbps" in IEEE
 assert "strong5GHz && multiBSSID" not in IEEE
 assert "peer_vht_rx_map=0x%04x peer_vht_tx_map=0x%04x" in IEEE

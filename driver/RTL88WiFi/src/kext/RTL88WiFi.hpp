@@ -111,6 +111,7 @@ public:
     static void privateMacTimerFired(OSObject *owner, IOTimerEventSource *timer);
     static void pendingScanTimerFired(OSObject *owner, IOTimerEventSource *timer);
     static void awdlTimerFired(OSObject *owner, IOTimerEventSource *timer);
+    static void roamingTimerFired(OSObject *owner, IOTimerEventSource *timer);
     /* IOService */
     bool     init(OSDictionary *props) override;
     bool     start(IOService *provider) override;
@@ -226,6 +227,9 @@ public:
     virtual void injectRxAWDLFrame(mbuf_t m) override;
     virtual IOWorkLoop *getRxWorkLoop() override;
     virtual void resumeTxAfterScanWindow() override;
+    virtual bool roamingActionsAllowed() const override;
+    virtual bool roamingControlAvailable() const override;
+    virtual bool scheduleRoamingControl(unsigned delayMs) override;
     /* IONetworkController link-state contract used by the reference IO80211 driver.  Defaults
      * are intentionally omitted here so the one-argument RTW88RxDelegate
      * overload remains unambiguous. */
@@ -315,6 +319,7 @@ private:
 
     IOTimerEventSource *_diagnosticsTimer = nullptr;
     IOTimerEventSource *_privateMacTimer = nullptr;
+    IOTimerEventSource *_roamingTimer = nullptr;
     char *_diagnosticsBuffer = nullptr;
     uint64_t _diagnosticsSamples = 0;
     /* Last periodic sample written to the diagnostic ring (r8 throttle). */
