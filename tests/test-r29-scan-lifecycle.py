@@ -13,7 +13,7 @@ IEEE_HPP = (KEXT / "RTW88IEEE80211.hpp").read_text()
 POLICY = (KEXT / "RTW88RoamScanPolicy.hpp").read_text()
 LOGGER = (ROOT / "tools/rtl88wifi-scanlog.sh").read_text()
 
-assert '1.0.12' in CTRL_CPP
+assert '1.0.13' in CTRL_CPP
 assert 'buildPrioritizedChannelList(' in IEEE_CPP
 assert 'same_band=%u cross_band=%u' in IEEE_CPP
 assert 'kConnectedScanMinIntervalUS = 15ULL * 1000ULL * 1000ULL' in POLICY

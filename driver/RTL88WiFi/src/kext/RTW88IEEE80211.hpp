@@ -22,6 +22,7 @@
 #include "RTW88JoinPolicy.hpp"
 #include "RTW88RoamScanPolicy.hpp"
 #include "RTW88MeshRoamPolicy.hpp"
+#include "RTW88Roaming.hpp"
 #include "RTW88WPA3.hpp"
 #include "RTW88BaPolicy.hpp"
 
@@ -117,6 +118,11 @@ public:
     virtual IOWorkLoop *getRxWorkLoop() = 0;
     /* Resume a packet queue that was held while the single radio scanned off-channel. */
     virtual void resumeTxAfterScanWindow() {}
+    /* Optional bounded 802.11v BTM timer hooks.  They run on the owning
+     * controller workloop and participate in its power-transition fence. */
+    virtual bool roamingActionsAllowed() const { return true; }
+    virtual bool roamingControlAvailable() const { return false; }
+    virtual bool scheduleRoamingControl(unsigned delayMs) { (void)delayMs; return false; }
     virtual void setLinkStatus(UInt32 status) = 0;
     virtual ~RTW88RxDelegate() {}
 };
@@ -288,6 +294,18 @@ public:
      * or declined uplink Block Ack agreement).  Called about every 5 s by the
      * controller's diagnostic timer, inside its hardware-safe window. */
     void housekeeping();
+    /* BTM ACK polling is driven by the controller's PM-fenced workloop timer. */
+    void btmTick();
+    bool btmPending() const { return __atomic_load_n(&_btmPhase, __ATOMIC_ACQUIRE) != 0; }
+    uint32_t btmPollMS() const {
+        const uint32_t phase = __atomic_load_n(&_btmPhase, __ATOMIC_ACQUIRE);
+        if (phase == 1) {
+            const uint32_t remaining = connectedScanRateLimitRemainingMS();
+            if (remaining) return remaining < 1000U ? remaining : 1000U;
+            return 100U;
+        }
+        return 20U;
+    }
     uint32_t freshSameESSPeerCount(uint64_t nowUS) const;
     uint32_t receivedFrameCount() const { return _rxFrameCount; }
     const char *scanEngine() const { return _scanEngine; }
@@ -318,6 +336,19 @@ private:
     void      doHandshake(const uint8_t *eapol, uint32_t len);
     void      doDisconnect();
     void      clearKeys();
+    void      resetRoamingState();
+    bool      roamingActionsReady() const;
+    bool      sendRoamingAction(const uint8_t *body, uint32_t length);
+    void      roamingTick(uint64_t nowMs);
+    void      handleRoamingAction(const uint8_t *frame, uint32_t length,
+                                  uint64_t nowMs, bool pmfVerified);
+    void      queueBtm(const RTW88Roaming::BtmRequest &request, uint64_t nowMs);
+    bool      selectBtmTarget(uint64_t nowMs, uint8_t target[6], uint8_t *channel);
+    bool      selectBtmScanChannel(uint16_t *channel) const;
+    bool      sendBtmResponse(uint8_t token, uint8_t status, const uint8_t *target = nullptr);
+    void      rejectBtm(uint8_t token, uint8_t status, const char *reason);
+    void      cancelBtm(const char *reason);
+    void      observeBtmTx(const uint8_t *frame, uint32_t length, bool acknowledged);
     void      releaseSta();
     bool      abortActiveScan(bool waitForIdle);
     void      restoreConnectedChannel();
@@ -516,6 +547,35 @@ private:
     bool                  _prefer5GHzUpgrade = true;
     bool                  _joinHasRequested = false;   /* BSSID macOS named, when we joined another */
     uint8_t               _joinRequestedBssid[6] = {};
+
+    /* 802.11k Neighbor Report / 802.11v BSS Transition Management state.
+     * AP reports are hints only; every BTM target is resolved to a fresh
+     * same-ESS scan-cache entry and revalidated by cmdRoam before switching. */
+    RTW88Roaming::Session _roaming;
+    bool _roamingCapsValid = false;
+    bool _stationNeighborReport = false;
+    bool _stationBTM = false;
+    uint64_t _roamRefreshLastMs = 0;
+    RTW88Roaming::BtmRequest _btmRequest = {};
+    uint8_t _btmSource[6] = {};
+    uint8_t _btmTarget[6] = {};
+    uint8_t _btmTargetChannel = 0;
+    uint16_t _btmScanChannel = 0;
+    uint64_t _btmScanStartUS = 0;
+    bool _btmScanAttempted = false;
+    bool _btmScanInProgress = false;
+    bool _btmScanCompleted = false;
+    uint32_t _btmPhase = 0; /* 0=idle, 1=queued/scan, 2=waiting for BTM-response TX ACK */
+    uint64_t _btmDeadlineMs = 0;
+    uint64_t _btmAckDeadlineMs = 0;
+    uint64_t _btmReplyIdentity = 0;
+    uint64_t _btmAckIdentity = 0; /* published atomically by TX status */
+    RTW88Roaming::BtmProtectedReceipt _btmProtectedReceipt;
+    const char *_btmLastOutcome = "idle";
+    uint32_t _neighborResponseCount = 0;
+    uint32_t _neighborInvalidCount = 0;
+    uint32_t _btmAcceptedCount = 0;
+    uint32_t _btmRejectedCount = 0;
 
     /* WPA3-Personal session state. SAE owns PMK/PMKID/PTK/GTK/IGTK and replay windows. */
     RTW88WPA3::Session _sae;

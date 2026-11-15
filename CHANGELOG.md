@@ -2,6 +2,37 @@
 
 This is the **single consolidated project changelog**. It includes the current semantic-version release and the complete available history from earlier project releases and development checkpoints. Older `rXX` labels below are retained only to identify historical internal milestones; current and future deliverables use version numbers such as `RTL88WiFi 1.0.12`, `1.0.13`, and so on.
 
+## 1.0.13 — 2026-11-15 — 802.11k Neighbor Reports and 802.11v BSS Transition Management
+
+This release adds bounded Neighbor Report discovery and AP-triggered BSS Transition Management to the existing RTL88WiFi 1.0.12 source line.
+
+### Changed
+
+- Added an 802.11k Neighbor Report Request/Response path. The station advertises only the Neighbor Report capability (not Beacon Measurement, Link Measurement, channel-load, noise or location reporting) and requests a report no more often than once per minute.
+- Validates AP action-frame addressing, action category/action, request dialog token, IE bounds, Neighbor Report BSSID/channel fields and preference subelements. Cached entries expire after 30 seconds and remain hints, not direct join authorization.
+- Added 802.11v BTM Request parsing and response generation. The station advertises BTM only if the AP advertises the matching Extended Capability and the PM-fenced controller timer is available.
+- A BTM request with the Preferred Candidate List bit set must carry a nonempty parseable candidate list. If the AP omits the list, a fresh Neighbor Report from the current association may be used as a hint.
+- Candidate evaluation is queued on the controller workloop. Existing cache entries must be fresh, same-SSID, same-privacy and compatible with the current CCMP/SAE security profile.
+- When no candidate is already suitable in the scan cache, the driver makes one directed connected scan attempt on the highest-preference regulatory-enabled candidate channel. The existing one-channel scan path prioritizes that channel and retains its scan lifecycle, home-channel restoration and TX hold behavior.
+- BTM Accept is sent only after a candidate has been observed and validated. The driver starts the existing `cmdRoam()` handoff only after the exact BTM response receives a TX ACK. For WPA3, the receipt correlates the protected response by header identity and CCMP PN without parsing ciphertext.
+- BSS Termination and ESS-Disassociation URL modes are rejected rather than partially acted upon. No URL is fetched. No 802.11r Fast Transition or FT key handling is introduced.
+- The bundle, kmod and `DriverBuild` identity are bumped to **1.0.13**.
+
+### Preserved
+
+- WPA3-Personal SAE, PMF/BIP, CCMP and GTK/IGTK handling.
+- The 1.0.12 WPA3 5 GHz preference, 1.0.11 mesh roaming and same-ESS cache policy, r29 scan lifecycle, r30 UniFi scan priority, existing private-MAC behavior and open/WPA2 association paths.
+- AP-provided Neighbor Report and BTM candidates cannot override local regulatory, freshness, same-ESS or security checks.
+
+### Validation status
+
+- `tests/test-rrm-btm.py` compiles the production bounded wire helpers and passes parser, dialog-token, action-frame-address, BTM response and PMF receipt tests. Source checks cover the capability advertisement, directed scan and TX-ACK-gated handoff.
+- Targeted existing mesh, scan, WPA3, association, handshake, RX-filter, private-MAC, join-report and queue-backpressure host tests passed in this environment.
+- No native Xcode/macOS kext build or real AP/hardware test was possible in the Linux environment. The target RTL8821CE must be rebuilt and tested before installation.
+- The initial BTM implementation scans only one preferred candidate channel per request. If no fresh secure candidate is seen, it declines and stays on the current AP. This is intentional rather than accepting an unverified BSSID.
+
+---
+
 ## 1.0.12 — 2026-11-15 — WPA3 5 GHz preference and release-version cleanup
 
 Based on the user's confirmed working WPA3-Personal implementation from the 1.0.11 source line. The user reported that WPA3-Personal association and traffic worked, but the driver selected a 2.4 GHz BSSID even though the same SSID was available on 5 GHz.

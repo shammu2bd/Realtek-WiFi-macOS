@@ -28,7 +28,7 @@ assert "((_targetBSS.channel > 14) != (b->channel > 14))" in IEEE_CPP
 assert "(rateDegraded && ((current.channel > 14) != (b->channel > 14)))" in IEEE_CPP
 assert "mesh ESS inventory fresh_nodes=" in IEEE_CPP
 assert "mesh ESS node id=%02x%02x%02x" in IEEE_CPP
-assert '1.0.12' in (KEXT / "RTL88WiFi.cpp").read_text()
+assert '1.0.13' in (KEXT / "RTL88WiFi.cpp").read_text()
 assert "_targetBSS.cipher != b->cipher" in IEEE_CPP
 assert "b->rsn_pmf_required" in IEEE_CPP
 

@@ -17,5 +17,5 @@ assert "RX_FLAG_DECRYPTED" in (rx_helper.read_text()), "RX helper must retain de
 assert "kRTW88EventHandshakeDone" in hpp, "WPA3 handshake event must be declared"
 assert "case kRTW88EventHandshakeDone:" in controller, "controller must consume WPA3 handshake event"
 assert "APPLE80211_M_RSN_HANDSHAKE_DONE" in controller[controller.index("case kRTW88EventHandshakeDone:"):], "controller must notify IO80211 after WPA3 handshake"
-assert '1.0.12' in controller
+assert '1.0.13' in controller
 print("PASS: RX flag include order and WPA3 handshake event declaration/dispatch")

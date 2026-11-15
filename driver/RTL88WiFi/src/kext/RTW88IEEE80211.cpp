@@ -703,6 +703,7 @@ void RTW88IEEE80211::free()
 
 void RTW88IEEE80211::clearKeys()
 {
+    resetRoamingState();
     clearWPA3();
     if (_powered && _hw && _hw->ops && _hw->ops->set_key) {
         if (_ptkConf && _ptkConf->hw_key_idx != 0xff)
@@ -1316,8 +1317,8 @@ void RTW88IEEE80211::rxFrame(struct sk_buff *skb)
 
 void RTW88IEEE80211::processRxMgmt(struct sk_buff *skb)
 {
+    bool pmfVerified = false;
     if (_saeMode) {
-        bool pmfVerified = false;
         if (!wpa3Mgmt(skb, pmfVerified)) { kfree_skb(skb); return; }
     }
     struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
@@ -1465,6 +1466,8 @@ void RTW88IEEE80211::processRxMgmt(struct sk_buff *skb)
         }
 
         if (_state == RTW88_STATE_CONNECTED) {
+            handleRoamingAction(skb->data, skb->len,
+                                rtw88JoinNowUS() / 1000ULL, pmfVerified);
             struct ieee80211_hdr_3addr *h3 =
                 (struct ieee80211_hdr_3addr *)skb->data;
             const uint8_t *b = skb->data + sizeof(*h3);
@@ -2261,6 +2264,8 @@ void RTW88IEEE80211::txStatus(struct sk_buff *skb)
     struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
     if (!(info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS))
         return;
+    observeBtmTx(skb->data, skb->len,
+                 (info->flags & IEEE80211_TX_STAT_ACK) != 0);
 
     const char *frameName = "frame";
     if (skb->len >= sizeof(struct ieee80211_hdr_3addr)) {
@@ -2570,6 +2575,13 @@ void RTW88IEEE80211::scanDone(bool aborted, bool manualWorkerFinalizer)
     if (connectedScanCompleted && _parent)
         _parent->resumeTxAfterScanWindow();
 
+    if (_btmScanInProgress && connectedScanCompleted) {
+        _btmScanInProgress = false;
+        _btmScanCompleted = !aborted && _meshScanLastChannel == _btmScanChannel;
+        IOLog("rtw88: 802.11v BTM target scan complete channel=%u success=%u\n",
+              _btmScanChannel, _btmScanCompleted ? 1U : 0U);
+    }
+
     if (_deferredConnectPending && _state == RTW88_STATE_IDLE && _powered) {
         char ssid[sizeof(_deferredSSID)] = {};
         char password[sizeof(_deferredPassword)] = {};
@@ -2768,6 +2780,28 @@ IOReturn RTW88IEEE80211::cmdScan(const uint16_t *requestedChannels,
             sameBandChannelPool, sameBandPoolCount,
             crossBandChannelPool, crossBandPoolCount,
             RTW88RoamScan::kMaxCrossBandChannelsPerPass);
+
+        /* A BTM-directed scan is a one-channel probe. Put that explicitly
+         * requested channel first even when the ordinary mesh channel pool is
+         * full; the regulatory enabled-channel test above remains authoritative. */
+        if (_btmPhase == 1 && _btmScanChannel && channelEnabled(_btmScanChannel)) {
+            uint32_t existing = meshChannelCount;
+            for (uint32_t i = 0; i < meshChannelCount; ++i) {
+                if (meshChannels[i] == _btmScanChannel) { existing = i; break; }
+            }
+            if (existing < meshChannelCount) {
+                const uint16_t selected = meshChannels[existing];
+                for (uint32_t i = existing; i > 0; --i)
+                    meshChannels[i] = meshChannels[i - 1];
+                meshChannels[0] = selected;
+            } else {
+                if (meshChannelCount < RTW88RoamScan::kMaxMeshChannels)
+                    ++meshChannelCount;
+                for (uint32_t i = meshChannelCount - 1; i > 0; --i)
+                    meshChannels[i] = meshChannels[i - 1];
+                meshChannels[0] = _btmScanChannel;
+            }
+        }
         if (meshChannelCount == 0) {
             IOLog("rtw88: connected scan skipped: no alternate enabled ESS channels cached or requested\n");
             return kIOReturnNotReady;
@@ -2863,8 +2897,11 @@ IOReturn RTW88IEEE80211::cmdScan(const uint16_t *requestedChannels,
             if (((chans[i]->hw_value > 14) == (_targetBSS.channel > 14)))
                 ++sameBandCandidates;
         const uint32_t crossBandCandidates = candidateCount - sameBandCandidates;
-        const uint32_t selectedIndex = RTW88RoamScan::nextRoundRobinIndex(
+        uint32_t selectedIndex = RTW88RoamScan::nextRoundRobinIndex(
             candidateCount, &_meshScanCursor);
+        if (_btmPhase == 1 && _btmScanChannel &&
+            meshChannels[0] == _btmScanChannel)
+            selectedIndex = 0;
         struct ieee80211_channel *selected = chans[selectedIndex];
         const uint16_t selectedChannel = selected ? selected->hw_value : 0;
         chans[0] = selected;
@@ -3583,7 +3620,13 @@ bool RTW88IEEE80211::wpa3TxMgmt(const uint8_t *frame, uint32_t n)
     memcpy(copy + 32, frame + 24, n - 24);
     copy[1] |= 0x40;
     const bool encrypted = _sae.encrypt(copy, n + 16);
+    if (encrypted && __atomic_load_n(&_btmPhase, __ATOMIC_ACQUIRE) == 2 &&
+        __atomic_load_n(&_btmReplyIdentity, __ATOMIC_ACQUIRE) != 0)
+        _btmProtectedReceipt.record(frame, n,
+            __atomic_load_n(&_btmReplyIdentity, __ATOMIC_ACQUIRE), _sae.txpn);
     const bool ok = encrypted && txMgmtFrame(copy, n + 16);
+    if (!ok && encrypted && _btmProtectedReceipt.matches(copy, n + 16))
+        _btmProtectedReceipt.clear();
     RTW88WPA3::wipe(copy, n + 16);
     IOFree(copy, n + 16);
     return ok;
@@ -4464,6 +4507,21 @@ bool RTW88IEEE80211::buildAssocReq(uint8_t *buf, uint32_t *len)
      * associations.  0x0431 accidentally included bit 4 in the base value,
      * making every supposedly open association look protected to the AP. */
     uint16_t cap = RTW88Join::associationCapability(_wpa2);
+    RTW88Roaming::Capabilities apRoamingCaps;
+    _roamingCapsValid = RTW88Roaming::capabilities(
+        _targetBSS.ies, _targetBSS.ies_len, apRoamingCaps);
+    if (_roamingCapsValid)
+        _roaming.ap = apRoamingCaps;
+    else
+        _roaming.ap = {};
+    const bool roamingSecurityReady = _roamingCapsValid && _wpa2 &&
+        !_externalSupplicant && _targetBSS.cipher == WLAN_CIPHER_SUITE_CCMP &&
+        (_saeMode || !apRoamingCaps.pmfRequired);
+    _stationNeighborReport = roamingSecurityReady && apRoamingCaps.neighborReport;
+    _stationBTM = roamingSecurityReady && apRoamingCaps.btm && _parent &&
+        _parent->roamingControlAvailable();
+    if (_stationNeighborReport)
+        cap |= 0x1000; /* Radio Measurement capability: Neighbor Report only. */
     body[0] = (uint8_t)(cap & 0xff);
     body[1] = (uint8_t)(cap >> 8);
     /* Listen interval: 10 */
@@ -4582,6 +4640,20 @@ bool RTW88IEEE80211::buildAssocReq(uint8_t *buf, uint32_t *len)
     };
     memcpy(body, wme_info, sizeof(wme_info));
     body += sizeof(wme_info);
+
+    /* 802.11k RRM Enabled Capabilities: Neighbor Report only. This driver
+     * does not claim Beacon Measurement request/report support. */
+    if (_stationNeighborReport) {
+        static const uint8_t neighborReportCaps[] = {70, 5, 0x02, 0, 0, 0, 0};
+        memcpy(body, neighborReportCaps, sizeof(neighborReportCaps));
+        body += sizeof(neighborReportCaps);
+    }
+    /* 802.11v Extended Capabilities bit 19 advertises BSS Transition. */
+    if (_stationBTM) {
+        static const uint8_t btmExtCaps[] = {127, 3, 0, 0, 0x08};
+        memcpy(body, btmExtCaps, sizeof(btmExtCaps));
+        body += sizeof(btmExtCaps);
+    }
 
     /* Advertise the cipher choice we actually implement: pairwise CCMP/AES
      * with the AP's selected group cipher.  Mixed TKIP+AES APs often list
@@ -5313,11 +5385,580 @@ void RTW88IEEE80211::startTxAggregation()
 /* Called about every 5 s while the radio is up.  Re-negotiates the uplink Block
  * Ack agreement after the AP declined it, never answered, or tore it down.
  * Idempotent and safe to skip: a missed tick only delays the next attempt. */
+/* ------------------------------------------------------------------ */
+/*  802.11k Neighbor Report / 802.11v BSS Transition Management        */
+/* ------------------------------------------------------------------ */
+
+void RTW88IEEE80211::resetRoamingState()
+{
+    _roaming.reset();
+    _roamingCapsValid = false;
+    _stationNeighborReport = false;
+    _stationBTM = false;
+    _roamRefreshLastMs = 0;
+    _btmRequest = {};
+    bzero(_btmSource, sizeof(_btmSource));
+    bzero(_btmTarget, sizeof(_btmTarget));
+    _btmTargetChannel = 0;
+    _btmScanChannel = 0;
+    _btmScanStartUS = 0;
+    _btmScanAttempted = false;
+    _btmScanInProgress = false;
+    _btmScanCompleted = false;
+    __atomic_store_n(&_btmPhase, 0U, __ATOMIC_RELEASE);
+    _btmDeadlineMs = 0;
+    _btmAckDeadlineMs = 0;
+    __atomic_store_n(&_btmReplyIdentity, 0ULL, __ATOMIC_RELEASE);
+    __atomic_store_n(&_btmAckIdentity, 0ULL, __ATOMIC_RELEASE);
+    _btmProtectedReceipt.clear();
+    _btmLastOutcome = "link-reset";
+    _neighborResponseCount = 0;
+    _neighborInvalidCount = 0;
+    _btmAcceptedCount = 0;
+    _btmRejectedCount = 0;
+}
+
+bool RTW88IEEE80211::roamingActionsReady() const
+{
+    return _roamingCapsValid && (_stationNeighborReport || _stationBTM) &&
+        _parent && _parent->roamingActionsAllowed() && _powered &&
+        _associatedVisible && _state == RTW88_STATE_CONNECTED &&
+        !_awdlOffChannel && !authenticationCancelled() &&
+        _wpa2 && !_externalSupplicant &&
+        _targetBSS.cipher == WLAN_CIPHER_SUITE_CCMP &&
+        _ptkConf && _gtkConf &&
+        (_saeMode ? (_sae.authorized && !_sae.pending) : !_roaming.ap.pmfRequired);
+}
+
+bool RTW88IEEE80211::sendRoamingAction(const uint8_t *body, uint32_t length)
+{
+    if (!roamingActionsReady() || !body || !length || length > 280)
+        return false;
+    uint8_t frame[24 + 280] = {};
+    frame[0] = 0xd0; /* Management / Action */
+    memcpy(frame + 4, _targetBSS.bssid, 6);
+    memcpy(frame + 10, _macAddr, 6);
+    memcpy(frame + 16, _targetBSS.bssid, 6);
+    const uint16_t sequence = uint16_t((_txSeq++ & 4095) << 4);
+    frame[22] = uint8_t(sequence);
+    frame[23] = uint8_t(sequence >> 8);
+    memcpy(frame + 24, body, length);
+    return txMgmtFrame(frame, 24 + length);
+}
+
+void RTW88IEEE80211::roamingTick(uint64_t nowMs)
+{
+    if (!_powered || !_associatedVisible || _state != RTW88_STATE_CONNECTED)
+        return;
+
+    RTW88Roaming::Capabilities caps;
+    _roamingCapsValid = RTW88Roaming::capabilities(
+        _targetBSS.ies, _targetBSS.ies_len, caps);
+    if (!_roamingCapsValid) {
+        _roaming.ap = {};
+        _stationNeighborReport = false;
+        _stationBTM = false;
+        return;
+    }
+    _roaming.ap = caps;
+    const bool securityReady = _wpa2 && !_externalSupplicant &&
+        _targetBSS.cipher == WLAN_CIPHER_SUITE_CCMP &&
+        (_saeMode || !caps.pmfRequired);
+    _stationNeighborReport = securityReady && caps.neighborReport;
+    _stationBTM = securityReady && caps.btm && _parent &&
+        _parent->roamingControlAvailable();
+
+    const bool hadPending = _roaming.pending;
+    const bool hadNeighbors = _roaming.neighbors.count != 0;
+    _roaming.expire(nowMs);
+    if (hadPending && !_roaming.pending) {
+        ++_neighborInvalidCount; /* timed out or invalidated by monotonic clock reset */
+        IOLog("rtw88: 802.11k neighbor response timed out token=%u\n",
+              _roaming.pendingToken);
+    }
+    if (hadNeighbors && !_roaming.neighbors.count)
+        IOLog("rtw88: 802.11k neighbor cache expired\n");
+
+    /* Refresh reports at most once per minute, including failed TX attempts. */
+    if (_roaming.requested && !_roaming.pending && _roamRefreshLastMs &&
+        nowMs >= _roamRefreshLastMs && nowMs - _roamRefreshLastMs >= 60000)
+        _roaming.requested = false;
+    if (!_stationNeighborReport || !roamingActionsReady() || _roaming.pending ||
+        _roaming.requested || _btmPhase)
+        return;
+
+    _roaming.requested = true;
+    _roamRefreshLastMs = nowMs;
+    if (++_roaming.tokenCounter == 0)
+        ++_roaming.tokenCounter;
+    uint8_t body[37] = {};
+    const size_t length = RTW88Roaming::neighborRequest(
+        body, sizeof(body), _roaming.tokenCounter,
+        reinterpret_cast<const uint8_t *>(_targetBSS.ssid), _targetBSS.ssid_len);
+    if (!length || !sendRoamingAction(body, uint32_t(length))) {
+        IOLog("rtw88: 802.11k neighbor request TX failed token=%u\n",
+              _roaming.tokenCounter);
+        return;
+    }
+    _roaming.pending = true;
+    _roaming.pendingToken = _roaming.tokenCounter;
+    _roaming.requestMs = nowMs;
+    IOLog("rtw88: 802.11k neighbor request submitted token=%u\n",
+          _roaming.pendingToken);
+}
+
+void RTW88IEEE80211::handleRoamingAction(const uint8_t *frame, uint32_t length,
+                                         uint64_t nowMs, bool pmfVerified)
+{
+    if (_saeMode && !pmfVerified)
+        return; /* WPA3 RRM/WNM actions must pass the authenticated PMF RX path. */
+    if (!frame || length < 26 || !RTW88Roaming::actionFromAP(
+            frame, length, _macAddr, _targetBSS.bssid))
+        return;
+
+    const uint8_t *body = frame + 24;
+    const size_t bodyLength = length - 24;
+    if (bodyLength < 2)
+        return;
+
+    if (!roamingActionsReady())
+        return;
+
+    if (body[0] == 5 && body[1] == 5) { /* Neighbor Report Response */
+        if (!_stationNeighborReport) return;
+        RTW88Roaming::Candidates candidates;
+        const bool timely = _roaming.pending && nowMs >= _roaming.requestMs &&
+            nowMs - _roaming.requestMs < RTW88Roaming::ResponseTimeoutMs;
+        const bool parsed = timely && RTW88Roaming::neighborResponse(
+            body, bodyLength, _roaming.pendingToken, candidates);
+        if (!parsed) {
+            ++_neighborInvalidCount;
+            IOLog("rtw88: 802.11k neighbor response rejected token=%u expected=%u pending=%u age_ms=%llu\n",
+                  bodyLength >= 3 ? body[2] : 0, _roaming.pendingToken,
+                  _roaming.pending ? 1U : 0U,
+                  _roaming.pending && nowMs >= _roaming.requestMs ?
+                    (unsigned long long)(nowMs - _roaming.requestMs) : ~0ULL);
+            return;
+        }
+        _roaming.pending = false;
+        _roaming.neighbors = candidates;
+        _roaming.neighborsMs = nowMs;
+        ++_neighborResponseCount;
+        IOLog("rtw88: 802.11k neighbor response accepted count=%u truncated=%u unknown_opclass=%u\n",
+              candidates.count, candidates.truncated ? 1U : 0U,
+              candidates.unknownClasses);
+        /* Neighbor Reports are scan/roam hints only. The driver never treats
+         * an advertised BSSID/channel as sufficient authorization to roam. */
+        return;
+    }
+
+    if (body[0] == 10 && body[1] == 7) { /* BSS Transition Management Request */
+        if (!_roaming.ap.btm) return;
+        RTW88Roaming::BtmRequest request;
+        if (!RTW88Roaming::btmRequest(body, bodyLength, request)) {
+            ++_btmRejectedCount;
+            IOLog("rtw88: 802.11v malformed BTM request dropped bytes=%u\n",
+                  unsigned(bodyLength));
+            return;
+        }
+        queueBtm(request, nowMs);
+    }
+}
+
+bool RTW88IEEE80211::selectBtmTarget(uint64_t nowMs, uint8_t target[6],
+                                      uint8_t *targetChannel)
+{
+    if (!target || !targetChannel || !_bssLock) return false;
+    bzero(target, 6);
+    *targetChannel = 0;
+    const uint64_t nowUs = nowMs * 1000ULL;
+    const bool currentPrivacy = (_targetBSS.capabilities & 0x0010) != 0;
+    const bool imminent = (_btmRequest.mode & 0x04) != 0;
+    int bestScore = -0x7fffffff;
+
+    IOLockLock(_bssLock);
+    for (unsigned i = 0; i < _btmRequest.candidates.count; ++i) {
+        const RTW88Roaming::Candidate &hint = _btmRequest.candidates.entries[i];
+        if ((hint.hasPreference && hint.preference == 0) ||
+            !RTW88MeshRoam::isValidUnicastBSSID(hint.bssid))
+            continue;
+        for (RTW88BSS *b = _bssList; b; b = b->next) {
+            if (memcmp(b->bssid, hint.bssid, 6) != 0 ||
+                memcmp(b->bssid, _targetBSS.bssid, 6) == 0 ||
+                !b->channel || b->channel != hint.channel ||
+                b->ssid_len != _targetBSS.ssid_len ||
+                memcmp(b->ssid, _targetBSS.ssid, _targetBSS.ssid_len) != 0 ||
+                (((b->capabilities & 0x0010) != 0) != currentPrivacy) ||
+                !RTW88MeshRoam::isFresh(nowUs, b->last_seen_us) ||
+                (_btmScanCompleted && b->last_seen_us < _btmScanStartUS) ||
+                b->rssi < -82 || b->rssi > 0)
+                continue;
+            if (currentPrivacy) {
+                if (b->cipher != WLAN_CIPHER_SUITE_CCMP ||
+                    b->cipher != _targetBSS.cipher ||
+                    (b->group_cipher && _targetBSS.group_cipher &&
+                     b->group_cipher != _targetBSS.group_cipher))
+                    continue;
+                if (_saeMode) {
+                    RTW88WPA3::Profile profile;
+                    if (!RTW88WPA3::profile(b->ies, b->ies_len, profile))
+                        continue;
+                } else if (b->rsn_pmf_required ||
+                           (b->rsn_has_sae && b->akm != 0x000FAC02) ||
+                           (_targetBSS.akm && b->akm && b->akm != _targetBSS.akm)) {
+                    continue;
+                }
+            }
+            /* A non-imminent request must not steer the station to a very
+             * weak candidate. Disassociation-imminent requests get a wider
+             * margin, but still require a usable fresh same-ESS BSS. */
+            if (!imminent && b->rssi < int(_rssi) - 8)
+                continue;
+            int score = int(hint.hasPreference ? hint.preference : 128) * 10000;
+            score += int(b->rssi) * 100;
+            if (b->channel > 14) score += 500;
+            if (b->rssi > -70) score += 100;
+            if (score > bestScore) {
+                bestScore = score;
+                memcpy(target, b->bssid, 6);
+                *targetChannel = b->channel;
+            }
+        }
+    }
+    IOLockUnlock(_bssLock);
+    return RTW88Roaming::unicast(target) && *targetChannel != 0;
+}
+
+bool RTW88IEEE80211::selectBtmScanChannel(uint16_t *channel) const
+{
+    if (!channel || !_hw || !_hw->wiphy) return false;
+    *channel = 0;
+    int bestPreference = -1;
+    for (unsigned i = 0; i < _btmRequest.candidates.count; ++i) {
+        const RTW88Roaming::Candidate &candidate = _btmRequest.candidates.entries[i];
+        if ((candidate.hasPreference && candidate.preference == 0) ||
+            !RTW88MeshRoam::isValidUnicastBSSID(candidate.bssid) ||
+            !candidate.channel || candidate.channel == _targetBSS.channel ||
+            memcmp(candidate.bssid, _targetBSS.bssid, 6) == 0)
+            continue;
+        bool enabled = false;
+        for (int bandIndex = 0; bandIndex < NL80211_NUM_BANDS && !enabled; ++bandIndex) {
+            struct ieee80211_supported_band *band = _hw->wiphy->bands[bandIndex];
+            if (!band) continue;
+            for (int j = 0; j < band->n_channels; ++j) {
+                const struct ieee80211_channel *entry = &band->channels[j];
+                if (entry->hw_value == candidate.channel &&
+                    !(entry->flags & IEEE80211_CHAN_DISABLED)) {
+                    enabled = true;
+                    break;
+                }
+            }
+        }
+        if (!enabled) continue;
+        const int preference = candidate.hasPreference ? candidate.preference : 128;
+        if (preference > bestPreference) {
+            bestPreference = preference;
+            *channel = candidate.channel;
+        }
+    }
+    return *channel != 0;
+}
+
+bool RTW88IEEE80211::sendBtmResponse(uint8_t token, uint8_t status,
+                                      const uint8_t *target)
+{
+    uint8_t body[11] = {};
+    const size_t length = RTW88Roaming::btmResponse(
+        body, sizeof(body), token, status, target);
+    return length && sendRoamingAction(body, uint32_t(length));
+}
+
+void RTW88IEEE80211::rejectBtm(uint8_t token, uint8_t status, const char *reason)
+{
+    if (sendBtmResponse(token, status))
+        ++_btmRejectedCount;
+    _btmLastOutcome = reason ? reason : "rejected";
+    IOLog("rtw88: 802.11v BTM rejected status=%u reason=%s\n",
+          status, _btmLastOutcome);
+}
+
+void RTW88IEEE80211::cancelBtm(const char *reason)
+{
+    __atomic_store_n(&_btmPhase, 0U, __ATOMIC_RELEASE);
+    __atomic_store_n(&_btmReplyIdentity, 0ULL, __ATOMIC_RELEASE);
+    __atomic_store_n(&_btmAckIdentity, 0ULL, __ATOMIC_RELEASE);
+    _btmProtectedReceipt.clear();
+    _btmDeadlineMs = 0;
+    _btmAckDeadlineMs = 0;
+    _btmScanChannel = 0;
+    _btmScanStartUS = 0;
+    _btmScanAttempted = false;
+    _btmScanInProgress = false;
+    _btmScanCompleted = false;
+    bzero(_btmSource, sizeof(_btmSource));
+    bzero(_btmTarget, sizeof(_btmTarget));
+    _btmTargetChannel = 0;
+    _btmLastOutcome = reason ? reason : "canceled";
+    if (reason)
+        IOLog("rtw88: 802.11v BTM canceled reason=%s\n", reason);
+}
+
+void RTW88IEEE80211::queueBtm(const RTW88Roaming::BtmRequest &request,
+                               uint64_t nowMs)
+{
+    RTW88Roaming::BtmRequest acceptedRequest = request;
+    if (!_stationBTM || !_parent || !_parent->roamingControlAvailable()) {
+        rejectBtm(acceptedRequest.token, 1, "BTM control unavailable");
+        return;
+    }
+    if (btmPending()) {
+        rejectBtm(acceptedRequest.token, 1, "another BTM transaction is pending");
+        return;
+    }
+    if (_roaming.btmReplied && nowMs >= _roaming.lastBtmMs &&
+        nowMs - _roaming.lastBtmMs < 1000) {
+        rejectBtm(acceptedRequest.token, 1, "BTM rate limited");
+        return;
+    }
+    _roaming.btmReplied = true;
+    _roaming.lastBtmMs = nowMs;
+
+    /* BSS termination and ESS-disassociation semantics need separate
+     * lifecycle handling; never claim to honour either in this release. */
+    if (acceptedRequest.mode & 0x18) {
+        rejectBtm(acceptedRequest.token, 1, "unsupported BSS termination / ESS mode");
+        return;
+    }
+    if (!(acceptedRequest.mode & 0x01)) {
+        /* Without an AP-supplied Preferred Candidate List, reuse a fresh
+         * 802.11k Neighbor Report only if one was solicited in this ESS. */
+        const bool reportFresh = _roaming.neighbors.count &&
+            nowMs >= _roaming.neighborsMs &&
+            nowMs - _roaming.neighborsMs < RTW88Roaming::CandidateLifetimeMs;
+        if (!reportFresh) {
+            rejectBtm(acceptedRequest.token, 7, "no preferred list or fresh Neighbor Report");
+            return;
+        }
+        acceptedRequest.candidates = _roaming.neighbors;
+    } else if (!acceptedRequest.candidates.count) {
+        rejectBtm(acceptedRequest.token, 7, "empty BTM preferred candidate list");
+        return;
+    }
+
+    uint64_t lifetime = 30000;
+    if (acceptedRequest.validity && _targetBSS.beacon_interval) {
+        const uint64_t validityMs = uint64_t(acceptedRequest.validity) *
+            uint64_t(_targetBSS.beacon_interval) * 1024ULL / 1000ULL;
+        if (validityMs && validityMs < lifetime) lifetime = validityMs;
+    }
+    if (acceptedRequest.mode & 0x04) {
+        if (!acceptedRequest.disassociationTimer || !_targetBSS.beacon_interval) {
+            rejectBtm(acceptedRequest.token, 7, "invalid disassociation-imminent timer");
+            return;
+        }
+        const uint64_t disassocMs = uint64_t(acceptedRequest.disassociationTimer) *
+            uint64_t(_targetBSS.beacon_interval) * 1024ULL / 1000ULL;
+        if (disassocMs < lifetime) lifetime = disassocMs;
+    }
+    if (lifetime < 300ULL) {
+        rejectBtm(acceptedRequest.token, 7, "candidate validity too short for safe handoff");
+        return;
+    }
+
+    _btmRequest = acceptedRequest;
+    memcpy(_btmSource, _targetBSS.bssid, 6);
+    bzero(_btmTarget, sizeof(_btmTarget));
+    _btmTargetChannel = 0;
+    _btmScanChannel = 0;
+    _btmScanStartUS = 0;
+    _btmScanAttempted = false;
+    _btmScanInProgress = false;
+    _btmScanCompleted = false;
+    _btmDeadlineMs = nowMs + lifetime;
+    _btmAckDeadlineMs = 0;
+    _btmLastOutcome = "BTM request queued for candidate validation";
+    _btmProtectedReceipt.clear();
+    __atomic_store_n(&_btmAckIdentity, 0ULL, __ATOMIC_RELEASE);
+    __atomic_store_n(&_btmReplyIdentity, 0ULL, __ATOMIC_RELEASE);
+    __atomic_store_n(&_btmPhase, 1U, __ATOMIC_RELEASE);
+
+    /* Queue evaluation on the controller workloop. A fresh cache candidate
+     * can be accepted immediately; otherwise one directed, regulatory-checked
+     * channel scan is attempted before returning a decline to the AP. */
+    if (!_parent->scheduleRoamingControl(1)) {
+        cancelBtm("could not arm BTM evaluation timer");
+        rejectBtm(acceptedRequest.token, 1, "BTM timer unavailable");
+        return;
+    }
+    IOLog("rtw88: 802.11v BTM request queued candidates=%u mode=0x%02x deadline_ms=%llu\n",
+          acceptedRequest.candidates.count, acceptedRequest.mode,
+          (unsigned long long)_btmDeadlineMs);
+}
+
+void RTW88IEEE80211::observeBtmTx(const uint8_t *frame, uint32_t length,
+                                  bool acknowledged)
+{
+    if (!acknowledged || !frame || length < 35 ||
+        __atomic_load_n(&_btmPhase, __ATOMIC_ACQUIRE) != 2)
+        return;
+    const uint64_t expected = __atomic_load_n(&_btmReplyIdentity, __ATOMIC_ACQUIRE);
+    if (!expected) return;
+    if (_saeMode) {
+        if (!_btmProtectedReceipt.matches(frame, length)) return;
+    } else {
+        const uint16_t fc = RTW88Enterprise::le16(frame);
+        if ((fc & 0x00fc) != 0x00d0 || (fc & 0x4000) ||
+            frame[24] != 10 || frame[25] != 8 || frame[27] != 0 ||
+            memcmp(frame + 29, _btmTarget, 6) != 0)
+            return;
+    }
+    const uint16_t sequence = RTW88Enterprise::le16(frame + 22) >> 4;
+    const uint64_t identity = RTW88Roaming::btmIdentity(sequence, frame + 4);
+    if (identity == expected)
+        __atomic_store_n(&_btmAckIdentity, identity, __ATOMIC_RELEASE);
+}
+
+void RTW88IEEE80211::btmTick()
+{
+    const uint32_t phase = __atomic_load_n(&_btmPhase, __ATOMIC_ACQUIRE);
+    if (phase != 1 && phase != 2)
+        return;
+    const uint64_t nowMs = rtw88JoinNowUS() / 1000ULL;
+    const bool connected = _state == RTW88_STATE_CONNECTED;
+    const bool connectedScan = _state == RTW88_STATE_SCANNING &&
+        _scanReturnState == RTW88_STATE_CONNECTED;
+    if (!_parent || !_parent->roamingActionsAllowed() || !_powered ||
+        !_associatedVisible || (!connected && !connectedScan) ||
+        memcmp(_btmSource, _targetBSS.bssid, 6) != 0) {
+        cancelBtm("link or power state changed before BTM ACK");
+        return;
+    }
+    if (_btmDeadlineMs && nowMs >= _btmDeadlineMs) {
+        cancelBtm("BTM request expired before switch");
+        return;
+    }
+
+    if (!connected) {
+        /* A BTM scan owns the radio temporarily. Wait for scanDone() to restore
+         * the home channel before examining refreshed BSS entries. */
+        if (_btmPhase == 1 && connectedScan)
+            return;
+        cancelBtm("unexpected scan/state while awaiting BTM response ACK");
+        return;
+    }
+
+    if (_btmPhase == 1) {
+        if (!roamingActionsReady()) {
+            rejectBtm(_btmRequest.token, 1, "roaming/security preflight unavailable");
+            cancelBtm("BTM preflight unavailable");
+            return;
+        }
+        if (_btmScanAttempted && !_btmScanInProgress && !_btmScanCompleted) {
+            rejectBtm(_btmRequest.token, 7, "directed candidate scan was aborted");
+            cancelBtm("BTM directed scan aborted");
+            return;
+        }
+        uint8_t target[6] = {};
+        uint8_t channel = 0;
+        if (selectBtmTarget(nowMs, target, &channel)) {
+            memcpy(_btmTarget, target, sizeof(_btmTarget));
+            _btmTargetChannel = channel;
+            _btmReplyIdentity = RTW88Roaming::btmIdentity(_txSeq, _btmSource);
+            __atomic_store_n(&_btmAckIdentity, 0ULL, __ATOMIC_RELEASE);
+            _btmAckDeadlineMs = nowMs + 250;
+            _btmLastOutcome = "waiting for BTM response ACK";
+            _btmProtectedReceipt.clear();
+            __atomic_store_n(&_btmPhase, 2U, __ATOMIC_RELEASE);
+            if (!_parent->scheduleRoamingControl(20)) {
+                cancelBtm("could not arm BTM ACK timer");
+                rejectBtm(_btmRequest.token, 1, "BTM timer unavailable");
+                return;
+            }
+            if (!sendBtmResponse(_btmRequest.token, 0, target)) {
+                cancelBtm("BTM acceptance TX failed");
+                return;
+            }
+            ++_btmAcceptedCount;
+            IOLog("rtw88: 802.11v BTM accept submitted channel=%u preference-policy=validated-cache token=%u\n",
+                  channel, _btmRequest.token);
+            return;
+        }
+        if (_btmScanAttempted) {
+            if (_btmScanInProgress)
+                return;
+            rejectBtm(_btmRequest.token, 7,
+                      _btmScanCompleted ? "no secure candidate found after directed scan" :
+                                          "directed candidate scan failed");
+            cancelBtm("BTM candidate unavailable after scan");
+            return;
+        }
+
+        uint16_t scanChannel = 0;
+        if (!selectBtmScanChannel(&scanChannel)) {
+            rejectBtm(_btmRequest.token, 7, "no eligible candidate channel to scan");
+            cancelBtm("BTM candidate channel unavailable");
+            return;
+        }
+        const uint32_t scanDelay = connectedScanRateLimitRemainingMS();
+        if (scanDelay) {
+            if (_btmDeadlineMs <= nowMs + scanDelay + 1000ULL) {
+                rejectBtm(_btmRequest.token, 7, "connected scan throttle exceeds BTM deadline");
+                cancelBtm("BTM scan throttle deadline");
+                return;
+            }
+            (void)_parent->scheduleRoamingControl(scanDelay < 1000U ? scanDelay : 1000U);
+            return;
+        }
+        _btmScanChannel = scanChannel;
+        _btmScanStartUS = rtw88JoinNowUS();
+        _btmScanAttempted = true;
+        _btmScanInProgress = true;
+        _btmScanCompleted = false;
+        const uint16_t requestedChannel = scanChannel;
+        const IOReturn scanResult = cmdScan(&requestedChannel, 1);
+        if (scanResult != kIOReturnSuccess) {
+            _btmScanInProgress = false;
+            rejectBtm(_btmRequest.token, 7, "directed candidate scan could not start");
+            cancelBtm("BTM directed scan start failed");
+            return;
+        }
+        IOLog("rtw88: 802.11v BTM directed scan started channel=%u deadline_ms=%llu\n",
+              scanChannel, (unsigned long long)_btmDeadlineMs);
+        return;
+    }
+
+
+    const uint64_t ack = __atomic_load_n(&_btmAckIdentity, __ATOMIC_ACQUIRE);
+    const uint64_t expected = __atomic_load_n(&_btmReplyIdentity, __ATOMIC_ACQUIRE);
+    if (expected && ack == expected) {
+        uint8_t target[6];
+        const uint8_t channel = _btmTargetChannel;
+        memcpy(target, _btmTarget, 6);
+        /* Clear the transaction before cmdRoam(): it calls clearKeys(), which
+         * resets per-association RRM/BTM state as part of the handoff. */
+        cancelBtm("BTM response acknowledged; starting validated roam");
+        const IOReturn result = cmdRoam(target, channel, false);
+        if (result == kIOReturnSuccess)
+            IOLog("rtw88: 802.11v BTM acknowledged; roam handoff submitted\n");
+        else
+            IOLog("rtw88: 802.11v BTM acknowledged but roam preflight failed result=0x%x\n",
+                  unsigned(result));
+        return;
+    }
+
+    if (nowMs >= _btmAckDeadlineMs) {
+        cancelBtm("BTM acceptance not acknowledged; staying on current AP");
+        return;
+    }
+    /* The controller callback re-arms this poll while btmPending() remains true. */
+}
+
 void RTW88IEEE80211::housekeeping()
 {
     if (_state != RTW88_STATE_CONNECTED || !_associatedVisible || !_sta || _handshakePending)
         return;
     const uint64_t now = rtw88JoinNowUS();
+    roamingTick(now / 1000ULL);
 
     /* Rate-adaptation reseed is independent of roaming and does not need an
      * alternate BSSID. On a strong, wide 5 GHz link, resend only the already
