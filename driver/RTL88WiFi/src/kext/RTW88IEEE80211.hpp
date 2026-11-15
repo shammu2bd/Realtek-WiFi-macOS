@@ -1,4 +1,5 @@
 /* Modified by X1REN41L on 2026-10-14 for RTL88WiFi 1.0.1; see the repository NOTICE.md. */
+/* Modified on 2026-10-23 for RTL88WiFi 1.0.2 (AWDL radio policy, mesh join selection); see NOTICE.md. */
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
  * RTW88IEEE80211.hpp — 802.11 state machine for rtw88 macOS port.
  *
@@ -18,6 +19,11 @@
 #include <sys/mbuf.h>
 #include <net/ethernet.h>
 #include <kern/thread_call.h>
+#include "RTW88JoinPolicy.hpp"
+#include "RTW88RoamScanPolicy.hpp"
+#include "RTW88MeshRoamPolicy.hpp"
+#include "RTW88WPA3.hpp"
+#include "RTW88BaPolicy.hpp"
 
 /* Opaque C driver handle */
 struct rtw_dev;
@@ -36,6 +42,10 @@ enum RTW88Event {
     kRTW88EventDeauth,
     kRTW88EventDisconnected,
     kRTW88EventRSSIChanged,
+    kRTW88EventRoamStart,
+    kRTW88EventRoamEnd,
+    /* Internal WPA3 SAE + EAPOL controlled port is fully authorized. */
+    kRTW88EventHandshakeDone,
 };
 
 class RTW88EventDelegate {
@@ -105,6 +115,8 @@ public:
      * IOEthernet parents that do not expose an AWDL VIF cannot leak it. */
     virtual void injectRxAWDLFrame(mbuf_t m) { if (m) mbuf_freem(m); }
     virtual IOWorkLoop *getRxWorkLoop() = 0;
+    /* Resume a packet queue that was held while the single radio scanned off-channel. */
+    virtual void resumeTxAfterScanWindow() {}
     virtual void setLinkStatus(UInt32 status) = 0;
     virtual ~RTW88RxDelegate() {}
 };
@@ -126,7 +138,13 @@ struct RTW88BSS {
     uint32_t cipher;       /* selected pairwise WLAN_CIPHER_SUITE_* */
     uint32_t group_cipher; /* selected group WLAN_CIPHER_SUITE_* */
     uint32_t akm;
+    /* RSN capabilities we must not silently ignore: SAE is recorded so a
+     * transition BSS can explicitly use WPA2-PSK fallback; MFPR requires
+     * protected management frames, which this port does not yet implement. */
+    uint8_t  rsn_has_sae;
+    uint8_t  rsn_pmf_required;
     uint32_t last_seen_scan;
+    uint64_t last_seen_us;       /* monotonic observation time for roam freshness */
     /* Final: a beacon from this BSSID carried a non-empty, non-zero SSID, so
      * the AP is not hidden even if a later frame has a blank SSID element. */
     uint8_t  beacon_named;
@@ -180,10 +198,30 @@ public:
     IOReturn setReceiveMulticast(bool active);
     IOReturn setAWDLReceiveMode(bool active);
     IOReturn setAWDLChannel(uint16_t channel);
+    /* RTL88WiFi 1.0.2 policy.  AWDL (AirDrop/Continuity) has never completed a
+     * peer exchange on this driver, yet while the awdl0 interface exists the
+     * scheduler (a) puts the NIC in near-promiscuous receive mode and (b)
+     * parks the radio on channels 6/44/149 and stalls en0 transmit, which is
+     * what overflowed the 256-packet output queue under upload.  Default:
+     * the AWDL virtual interface exists but never takes the radio.  Set the
+     * Info.plist property RTL88WiFiAWDLRadio to true to restore the old
+     * behaviour for experiments. */
+    /* 1.0.4 band policy (Info.plist key RTL88WiFiPrefer5GHz, default true): when
+     * macOS asks for a 2.4 GHz node but a usable 5 GHz node of the same SSID is
+     * known, join the 5 GHz node.  False honours the requested BSSID exactly. */
+    void setPrefer5GHzUpgrade(bool on) { _prefer5GHzUpgrade = on; }
+    void setAWDLRadioAllowed(bool allowed) { _awdlRadioAllowed = allowed; }
+    bool awdlRadioAllowed() const { return _awdlRadioAllowed; }
     bool canTransmitAWDL() const;
     bool staAssociatedForAWDL() const { return _associatedVisible && _state == RTW88_STATE_CONNECTED; }
     uint16_t infrastructureChannel() const { return _targetBSS.channel; }
     bool staTxBlockedByAWDL() const { return _awdlOffChannel; }
+    /* Connected software scans temporarily move the single STA radio off its AP channel. */
+    bool staTxBlockedByConnectedScan() const {
+        return _state == RTW88_STATE_SCANNING &&
+               _scanReturnState == RTW88_STATE_CONNECTED &&
+               !_manualScanOnHomeChannel;
+    }
     void restoreSTAChannelAfterAWDL();
     void setAWDLAddress(const uint8_t *mac);
     IOReturn  powerOn();     /* enable: rtw_core_start */
@@ -194,20 +232,35 @@ public:
     /* Native AWDL Ethernet -> 802.11 direct data encapsulation. Consumes m. */
     bool      txAWDLDataFrame(mbuf_t m);
     void      getMACAddress(uint8_t *mac);
+    void      getPermanentMACAddress(uint8_t *mac);
     IOReturn  setMACAddress(const uint8_t *mac);
+    IOReturn  setRegulatoryCountry(const char alpha2[2]);
 
     /* Called from compat layer (ieee80211_rx_irqsafe) */
     void      rxFrame(struct sk_buff *skb);
     void      txStatus(struct sk_buff *skb);
-    void      scanDone(bool aborted);
+    void      scanDone(bool aborted, bool manualWorkerFinalizer = false);
 
     /* Control interface — called from RTW88UserClient */
     uint32_t deauthReason() const { return _deauthReason; }
     RTW88State rawState() const { return _state; }
     bool associatedVisible() const { return _associatedVisible; }
-    IOReturn  cmdScan();
+    /* Connected scans are bounded to candidate channels for the current ESS.
+     * Disconnected scans retain the normal full-channel discovery behavior. */
+    IOReturn  cmdScan(const uint16_t *requestedChannels = nullptr,
+                      uint32_t requestedCount = 0);
+    uint32_t  connectedScanRateLimitRemainingMS() const;
     IOReturn  cmdConnect(const char *ssid, const char *password, const uint8_t *pmk = nullptr,
-                         const uint8_t *bssid = nullptr, bool externalSupplicant = false);
+                         const uint8_t *bssid = nullptr, bool externalSupplicant = false,
+                         bool sae = false);
+    IOReturn  cmdConnectSAE(const char *ssid, const char *password, const uint8_t *bssid = nullptr);
+    bool      matchesSAETarget(const char *ssid, const uint8_t *bssid) const;
+    bool      matchesSAEJoin(const char *ssid, const char *password, const uint8_t *bssid) const;
+    bool      matchesPSKPasswordJoin(const char *ssid, const char *password, const uint8_t *bssid) const;
+    bool      bssOffersSAE(const char *ssid, const uint8_t *bssid) const;
+    bool      bssOffersPSKOnly(const char *ssid, const uint8_t *bssid) const;
+    bool      saeHardwareCCMP() const;
+    IOReturn  cmdRoam(const uint8_t *targetBSSID, uint8_t targetChannel, bool evaluateCache);
     IOReturn  cmdInstallExternalKey(bool pairwise, uint8_t keyidx, uint32_t cipher,
                                     const uint8_t *key, uint8_t key_len);
     bool      externalKeysReady() const { return _externalPTKInstalled && _externalGTKInstalled; }
@@ -215,6 +268,7 @@ public:
     void      clearAssocRsnIE();
     bool      matchesPendingJoin(const char *ssid, const uint8_t *bssid, const uint8_t *pmk) const;
     void      failJoin(const char *stage);
+    void      finishRoam(bool success);
     IOReturn  copyTargetIEs(uint8_t *out, uint32_t capacity, uint32_t *len) const;
     IOReturn  copyTargetRsnIE(uint8_t *out, uint16_t capacity, uint16_t *len) const;
     IOReturn copyScanBSS(uint32_t index, RTW88BSS *out);
@@ -230,6 +284,11 @@ public:
     uint8_t channelWidthMHz() const { return _connChanWidth; }
     static void parseBssOperation(const uint8_t *ies, uint16_t ielen, RTW88BssOperation *op);
     bool txAggregationActive() const { return _txBaActive; }
+    /* 1.0.6: periodic upkeep of a connected link (currently: re-negotiating a lost
+     * or declined uplink Block Ack agreement).  Called about every 5 s by the
+     * controller's diagnostic timer, inside its hardware-safe window. */
+    void housekeeping();
+    uint32_t freshSameESSPeerCount(uint64_t nowUS) const;
     uint32_t receivedFrameCount() const { return _rxFrameCount; }
     const char *scanEngine() const { return _scanEngine; }
     uint32_t scanChannelCount() const { return _lastScanChannelCount; }
@@ -268,6 +327,32 @@ private:
 
     bool      buildAssocReq(uint8_t *buf, uint32_t *len);
     bool      buildAuthReq(uint8_t *buf, uint32_t *len);
+
+    /* 1.0.2 multi-BSS (mesh) join.  *Locked helpers need _bssLock held. */
+    RTW88BSS *selectBssLocked(const char *ssid, size_t ssidLen, const uint8_t *pinned,
+                              bool skipTried, int privacyMatch);
+    /* The BSS to join for a request: the pinned BSSID when macOS named a known
+     * one, else the best node.  1.0.4: a pinned 2.4 GHz node is upgraded to a
+     * fresh, usable 5 GHz node of the same SSID (see _prefer5GHzUpgrade). */
+    RTW88BSS *selectBssForJoinLocked(const char *ssid, size_t ssidLen, const uint8_t *pinned,
+                                     bool *upgraded);
+    RTW88BSS *selectWpa3BssForJoinLocked(const char *ssid, size_t ssidLen,
+                                         const uint8_t *pinned, bool skipTried,
+                                         bool *upgraded);
+    bool      hasUntriedAlternativeLocked();
+    void      applyAssocRsnOverride(bool externalSupplicant, bool havePmk, bool havePassword);
+    bool      retryOtherBss(const char *stage);     /* true: now joining another BSS */
+    void      joinAttemptFailed(const char *stage); /* retry elsewhere, else failJoin() */
+
+    /* WPA3-Personal station path: hostap SAE, EAPOL-Key, CCMP and PMF/BIP. */
+    bool      wpa3Auth();
+    void      wpa3ReceiveAuth(const uint8_t *frame, uint32_t len);
+    void      wpa3Eapol(const uint8_t *data, uint32_t len);
+    bool      wpa3Mgmt(struct sk_buff *skb, bool &pmfVerified);
+    bool      wpa3RxData(struct sk_buff *skb);
+    bool      wpa3InstallPairwise();
+    bool      wpa3TxMgmt(const uint8_t *frame, uint32_t len);
+    void      clearWPA3();
 
     /* WPA2 4-way handshake */
     void      handleEAPOL(const uint8_t *data, uint32_t len);
@@ -363,8 +448,11 @@ private:
     uint16_t            _awdlChannel = 0;
     uint16_t            _awdlPreparedChannel = 0;
     bool                _awdlOffChannel = false;
+    bool                _awdlRadioAllowed = false;   /* see setAWDLRadioAllowed() */
+    bool                _awdlPolicyLogged = false;
     uint8_t             _awdlAddress[6] = {};
     uint8_t             _macAddr[6]   = {};
+    uint8_t             _permanentMacAddr[6] = {};
     uint32_t            _timeoutMs    = 0;
 
     /* Scan results */
@@ -372,6 +460,15 @@ private:
     uint32_t            _bssCount     = 0;
     IOLock             *_bssLock      = nullptr;
     uint32_t            _scanGeneration = 0;
+    uint32_t            _meshScanCursor = 0; /* round-robin cursor across band-prioritised candidates */
+    uint64_t            _lastConnectedScanStartUS = 0;
+    uint32_t            _connectedScanThrottleEvents = 0; /* atomic, log sampled events only */
+    volatile uint32_t   _manualScanStage = 0; /* worker progress telemetry */
+    volatile uint16_t   _manualScanActiveChannel = 0;
+    uint64_t            _meshScanStartUS = 0;
+    uint16_t            _meshScanLastChannel = 0;
+    uint32_t            _meshScanCandidateChannels = 0;
+    bool                _scanPartial = false; /* connected, bounded scan: do not age/prune unscanned BSSs */
     const char *        _scanEngine = "not-started";
     uint32_t            _lastScanChannelCount = 0, _lastScanCacheCount = 0;
     uint32_t            _scanVisited2GHz = 0, _scanVisited5GHz = 0;
@@ -389,6 +486,9 @@ private:
      * separate scan implementation, so preserve the request and start it as
      * soon as scanDone() returns the backend to IDLE. */
     bool                _deferredConnectPending = false;
+    /* One full refresh is allowed when ASSOCIATE names a BSS missing from the
+     * cache; the refreshed retry still honours the exact requested BSSID. */
+    bool                _missingBssRescanAttempted = false;
     char                _deferredSSID[33] = {};
     char                _deferredPassword[64] = {};
     uint8_t             _deferredPMK[32] = {};
@@ -396,11 +496,33 @@ private:
     uint8_t             _deferredBSSID[6] = {};
     bool                _deferredBSSIDValid = false;
     bool                _deferredExternalSupplicant = false;
+    bool                _deferredSAE = false;
 
     /* Target BSS for connection */
     RTW88BSS            _targetBSS    = {};
+    bool                _roamInProgress = false;
+    RTW88BSS            _roamPreviousBSS = {};
+    int                 _roamPreviousRSSI = -100;
+    uint64_t            _lastRoamAttemptUS = 0;
+    uint64_t            _meshLowRateSinceUS = 0;
+    uint64_t            _meshLastRateRecoveryUS = 0;
+    uint32_t            _meshLastLoggedRateKbps = 0;
+    uint8_t             _lastRoamTarget[6] = {};
     char                _password[64] = {};
     uint8_t             _authAttempts = 0;
+    /* 1.0.2: nodes that recently failed and nodes already tried in this join. */
+    RTW88Join::FailMemory _joinFail;
+    RTW88Join::TriedSet   _joinTried;
+    bool                  _prefer5GHzUpgrade = true;
+    bool                  _joinHasRequested = false;   /* BSSID macOS named, when we joined another */
+    uint8_t               _joinRequestedBssid[6] = {};
+
+    /* WPA3-Personal session state. SAE owns PMK/PMKID/PTK/GTK/IGTK and replay windows. */
+    RTW88WPA3::Session _sae;
+    bool     _saeMode = false;
+    bool     _saeSoftwareCCMP = false;
+    uint32_t _saeHwTx = 0, _saeHwRx = 0, _saeSwRx = 0, _saeRxRejected = 0;
+    bool     _internalEapolTx = false;
 
     /* WPA2 key material */
     uint8_t  _pmk[32]  = {};
@@ -444,6 +566,7 @@ private:
     uint8_t  _connChanWidth = 20;  /* negotiated operating width: 20/40/80 MHz */
     uint8_t  _baDialog   = 0;      /* rolling ADDBA-request dialog token       */
     bool     _txBaPending = false;
+    RTW88Ba::Recovery _baRecovery;      /* when to (re)send ADDBA; see RTW88BaPolicy.hpp */
     uint16_t _baBufSize  = 64;     /* advertised BlockAck buffer/window size   */
 
     /* RX A-MPDU reorder buffer — one per TID with an active downlink BA.

@@ -175,6 +175,9 @@ struct rtw88_tx_rate {
     uint8_t  sgi;     /* short guard interval */
 };
 bool rtw88_get_tx_rate(struct rtw88_tx_rate *out);
+/* Re-send the peer's negotiated rate mask to firmware (no forced/fixed MCS).
+ * Used sparingly after a persistent strong-signal/low-rate mesh condition. */
+bool rtw88_reset_sta_rate_adaptation(void);
 /* Averaged RX SNR (dB) of frames from the associated BSS, from the per-path
  * PHY-status SNR rtw88 parses on 8822B/8822C (dm_info.ewma_snr).  rtw88 has
  * no noise-floor measurement, and 8821C reports no SNR.  Returns false when

@@ -19,10 +19,13 @@
 #include <IOKit/80211/IO80211P2PInterface.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/IOInterruptEventSource.h>
+#include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOUserClient.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOCommandGate.h>
+#include <IOKit/IOLocks.h>
 #include <IOKit/pwr_mgt/IOPMpowerState.h>
 #include <kern/thread.h>
 
@@ -105,6 +108,8 @@ class RTL88WiFi : public IO80211Controller, public RTW88EventDelegate, public RT
 
 public:
     static void diagnosticsTimerFired(OSObject *owner, IOTimerEventSource *timer);
+    static void privateMacTimerFired(OSObject *owner, IOTimerEventSource *timer);
+    static void pendingScanTimerFired(OSObject *owner, IOTimerEventSource *timer);
     static void awdlTimerFired(OSObject *owner, IOTimerEventSource *timer);
     /* IOService */
     bool     init(OSDictionary *props) override;
@@ -113,7 +118,13 @@ public:
     void     free() override;
     void     systemWillShutdown(IOOptionBits specifier) override;
     IOReturn setPowerState(unsigned long powerStateOrdinal, IOService *whatDevice) override;
+    IOReturn setProperties(OSObject *properties) override;
     IOReturn registerWithPolicyMaker(IOService *policyMaker) override;
+    /* Password-only join entry used by both the native association ABI and
+     * the extended Sequoia/Tahoe host32 request. Credentials are never stored
+     * as IORegistry properties. */
+    IOReturn connectPersonalPassword(const char *ssid, const char *password,
+                                     const uint8_t *bssid, uint32_t authUpper);
 
     /* IONetworkController (required minimum set) */
     const OSString *newVendorString() const override;
@@ -155,6 +166,15 @@ public:
                                       int request_number,
                                       IO80211Interface *interface,
                                       void *data) override;
+    /* PRIVATE_MAC selector 238 is queried through both Legacy and Skywalk
+     * split GET entry points on recent macOS releases. */
+    virtual SInt32 apple80211_ioctl_get(IO80211Interface *interface,
+                                        IO80211VirtualInterface *virtualInterface,
+                                        ifnet_t net, void *data) override;
+#if __IO80211_TARGET >= __MAC_10_15
+    virtual SInt32 apple80211_ioctl_get(IO80211SkywalkInterface *skywalkInterface,
+                                        void *data) override;
+#endif
 
 #if __IO80211_TARGET >= __MAC_10_15
     /* Sonoma+ with the restored Ventura Legacy/Skywalk stack sends the join
@@ -205,6 +225,7 @@ public:
     virtual void injectRxActionFrame(const uint8_t *frame, uint32_t len, int8_t rssi, uint16_t channel) override;
     virtual void injectRxAWDLFrame(mbuf_t m) override;
     virtual IOWorkLoop *getRxWorkLoop() override;
+    virtual void resumeTxAfterScanWindow() override;
     /* IONetworkController link-state contract used by the reference IO80211 driver.  Defaults
      * are intentionally omitted here so the one-argument RTW88RxDelegate
      * overload remains unambiguous. */
@@ -217,6 +238,11 @@ private:
     __attribute__((__noinline__)) SInt32 handleNativeRequest(unsigned int request_type, int request_number, IO80211Interface *interface, void *data);
     __attribute__((__noinline__)) IOReturn handleRequestCOUNTRY_CODE(bool isSet, void *data);
     __attribute__((__noinline__)) IOReturn handleRequestPHY_MODE(bool isSet, void *data);
+    __attribute__((__noinline__)) IOReturn handleRequestPRIVATE_MAC(bool isSet, void *data);
+    SInt32 handlePrivateMACBSDRequest(unsigned request_type, struct apple80211req *req,
+                                      const char *ingress);
+    IOReturn applyPrivateMACAddress(bool rotate);
+    void armPrivateMACTimer(UInt32 milliseconds);
     __attribute__((__noinline__)) IOReturn handleRequestRATE(bool isSet, void *data);
     __attribute__((__noinline__)) IOReturn handleRequestRATE_SET(bool isSet, void *data);
     __attribute__((__noinline__)) IOReturn handleRequestCHANNELS_INFO(bool isSet, void *data);
@@ -243,9 +269,18 @@ private:
 
     apple80211_scan_result _scanResult = {};
     uint32_t _scanCursor = 0;
+    /* 1.0.5: APPLE80211_IOC_PRIVATE_MAC state; see handleRequestPRIVATE_MAC(). */
+    bool     _privMacEnabled = true;
+    uint32_t _privMacFlags = 0;
+    uint32_t _privMacIntervalS = 0;
+    uint32_t _privMacGets = 0;
+    uint8_t  _privMacAddress[6] = {};
+    bool     _privMacAddressValid = false;
+    bool     _privMacApplyPending = false;
+    bool     _privMacRotatePending = false;
     uint32_t _authLower = APPLE80211_AUTHTYPE_OPEN;
     uint32_t _authUpper = APPLE80211_AUTHTYPE_NONE;
-    uint8_t  _countryCode[APPLE80211_MAX_CC_LEN] = {'Z', 'Z', 0};
+    uint8_t  _countryCode[APPLE80211_MAX_CC_LEN] = {'Z', 'Z', 0}; /* unknown until Apple80211 supplies the device's active country */
     RTW88RoamProfileBandData _roamProfile = {};
     bool _roamProfileValid = false;
 
@@ -279,6 +314,7 @@ private:
     RTW88IEEE80211         *_ieee80211   = nullptr;  /* reused as-is from rtw88 core */
 
     IOTimerEventSource *_diagnosticsTimer = nullptr;
+    IOTimerEventSource *_privateMacTimer = nullptr;
     char *_diagnosticsBuffer = nullptr;
     uint64_t _diagnosticsSamples = 0;
     /* Last periodic sample written to the diagnostic ring (r8 throttle). */
@@ -296,12 +332,35 @@ private:
     IO80211WorkLoop       *_workLoop    = nullptr;
 
     IOEthernetAddress       _macAddr;
-    bool                    _scanInProgress = false;
+    volatile bool           _scanInProgress = false;
+    bool scanRequestInProgress() const {
+        return __atomic_load_n(&_scanInProgress, __ATOMIC_ACQUIRE);
+    }
+    void setScanRequestInProgress(bool active) {
+        __atomic_store_n(&_scanInProgress, active, __ATOMIC_RELEASE);
+    }
+    bool tryBeginScanRequest() {
+        bool expected = false;
+        return __atomic_compare_exchange_n(&_scanInProgress, &expected, true,
+                                           false, __ATOMIC_ACQ_REL,
+                                           __ATOMIC_ACQUIRE);
+    }
+    IOLock                 *_pendingScanLock = nullptr;
+    IOTimerEventSource     *_pendingScanTimer = nullptr;
+    bool                    _pendingScanRequest = false;
+    uint32_t                _pendingScanRequestBursts = 0;
+    uint16_t                _pendingScanChannels[128] = {};
+    uint32_t                _pendingScanChannelCount = 0;
+    uint32_t                _pendingScanDispatchDeferrals = 0; /* guarded by _pendingScanLock */
+    uint32_t                _pendingScanThrottleDeferrals = 0; /* atomic, log sampled events only */
+    uint32_t                _pendingScanStableMismatchCount = 0; /* guarded by _pendingScanLock */
     UInt32                  _powerSaveLevel = APPLE80211_POWERSAVE_MODE_DISABLED;
     volatile UInt32         _nativeAssocDispatchCount = 0;
     /* r7: last logged GET signature per diagnosed selector (change-only log). */
     uint64_t                _getDiagLast[5] = {~0ULL, ~0ULL, ~0ULL, ~0ULL, ~0ULL};
     void logGetResult(int request_number, SInt32 ret, const void *data);
+    void queuePendingScanRequest(const uint16_t *channels, uint32_t count);
+    void dispatchPendingScanRequest();
     uint32_t                _awdlPeerPresencePosts = 0;
     uint32_t                _awdlPeerAbsencePosts = 0;
     uint32_t                _awdlPeerIPv6Posts = 0;

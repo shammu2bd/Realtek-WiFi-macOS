@@ -112,7 +112,6 @@ DRIVER_SRCS := \
     $(LINUX_SRC)/phy.c \
     $(LINUX_SRC)/fw.c \
     $(LINUX_SRC)/tx.c \
-    $(LINUX_SRC)/rx.c \
     $(LINUX_SRC)/sec.c \
     $(LINUX_SRC)/efuse.c \
     $(LINUX_SRC)/coex.c \
@@ -159,20 +158,23 @@ KEXT_SRCS := \
     $(KEXT_SRC)/RTW88Kext.cpp \
     $(KEXT_SRC)/RTW88PCIDevice.cpp \
     $(KEXT_SRC)/RTW88UserClient.cpp \
-    $(KEXT_SRC)/RTW88IEEE80211.cpp
+    $(KEXT_SRC)/RTW88IEEE80211.cpp \
+    $(KEXT_SRC)/RTW88WPA3Crypto.cpp
 
 # ------------------------------------------------------------------ #
 # Object files                                                         #
 # ------------------------------------------------------------------ #
 
-DRIVER_OBJS   := $(patsubst $(LINUX_SRC)/%.c,  $(BUILD_DIR)/driver/%.o, $(DRIVER_SRCS))
+DRIVER_OBJS   := $(patsubst $(LINUX_SRC)/%.c,  $(BUILD_DIR)/driver/%.o, $(DRIVER_SRCS)) \
+                 $(BUILD_DIR)/driver/rx.o
 CHIP_OBJS     := $(patsubst $(LINUX_SRC)/%.c,  $(BUILD_DIR)/driver/%.o, $(CHIP_SRCS))
 COMPAT_OBJS   := $(patsubst $(COMPAT_DIR)/%.c, $(BUILD_DIR)/compat/%.o, $(COMPAT_SRCS))
 FIRMWARE_OBJS := $(patsubst $(COMPAT_DIR)/%.c, $(BUILD_DIR)/compat/%.o, $(FIRMWARE_SRCS))
 KMOD_OBJS   := $(patsubst $(KEXT_SRC)/%.c,   $(BUILD_DIR)/kext/%.o,   $(KMOD_SRCS))
 KEXT_OBJS   := $(patsubst $(KEXT_SRC)/%.cpp, $(BUILD_DIR)/kext/%.o,   $(KEXT_SRCS))
 
-ALL_OBJS    := $(DRIVER_OBJS) $(CHIP_OBJS) $(COMPAT_OBJS) $(FIRMWARE_OBJS) $(KMOD_OBJS) $(KEXT_OBJS)
+WPA3_SAE_ARCHIVE := $(BUILD_DIR)/wpa3/librtw_sae.a
+ALL_OBJS    := $(DRIVER_OBJS) $(CHIP_OBJS) $(COMPAT_OBJS) $(FIRMWARE_OBJS) $(KMOD_OBJS) $(KEXT_OBJS) $(WPA3_SAE_ARCHIVE)
 
 # ------------------------------------------------------------------ #
 # Linker flags                                                         #
@@ -212,6 +214,12 @@ $(BUILD_DIR)/driver/%.o: $(LINUX_SRC)/%.c | $(BUILD_DIR)/driver
 	@echo "  CC   $(notdir $<)"
 	$(CC) $(DRIVER_CFLAGS) -c $< -o $@
 
+# RX descriptor wrapper preserves the upstream rtw88 parser while exposing
+# CRC/ICV and AES-CCMP verification flags required by the WPA3 software path.
+$(BUILD_DIR)/driver/rx.o: $(COMPAT_DIR)/rtw88_rx.c $(COMPAT_DIR)/rtw88_rx_security.h $(LINUX_SRC)/rx.c | $(BUILD_DIR)/driver
+	@echo "  CC   rtw88_rx.c (security flags)"
+	$(CC) $(DRIVER_CFLAGS) -c $(COMPAT_DIR)/rtw88_rx.c -o $@
+
 # Compile compat C files (with Linux compat headers)
 $(BUILD_DIR)/compat/%.o: $(COMPAT_DIR)/%.c | $(BUILD_DIR)/compat
 	@echo "  CC   $(notdir $<)"
@@ -242,6 +250,15 @@ $(BUILD_DIR)/kext/kmod_info.o: $(KEXT_SRC)/kmod_info.c | $(BUILD_DIR)/kext
 	@echo "  CC   kmod_info.c"
 	$(CC) $(KEXT_FLAGS) -c $< -o $@
 
+# WPA3 CCMP crypto is an isolated scalar translation unit (no SIMD in kernel).
+$(BUILD_DIR)/kext/RTW88WPA3Crypto.o: $(KEXT_SRC)/RTW88WPA3Crypto.cpp | $(BUILD_DIR)/kext
+	@echo "  CXX  RTW88WPA3Crypto.cpp (scalar kernel crypto)"
+	$(CXX) $(KEXT_CXXFLAGS) -O2 -fno-vectorize -fno-slp-vectorize -mno-sse -mno-sse2 -mno-avx -c $< -o $@
+
+# Private SAE/Dragonfly + Mbed TLS primitives imported under the rtw_sae namespace.
+$(WPA3_SAE_ARCHIVE): $(shell find $(PROJ_ROOT)/experimental/wpa3/rtw80211/sae -type f) $(PROJ_ROOT)/scripts/build-sae.sh | $(BUILD_DIR)/wpa3
+	DERIVED_FILE_DIR="$(BUILD_DIR)/wpa3" SDKROOT="$(SDK)" MACOSX_DEPLOYMENT_TARGET=13.0 PROJECT_DIR="$(PROJ_ROOT)" bash $(PROJ_ROOT)/scripts/build-sae.sh
+
 # Compile kext C++ wrapper files
 $(BUILD_DIR)/kext/%.o: $(KEXT_SRC)/%.cpp | $(BUILD_DIR)/kext
 	@echo "  CXX  $(notdir $<)"
@@ -270,6 +287,9 @@ $(BUILD_DIR)/compat:
 	mkdir -p $@
 
 $(BUILD_DIR)/kext:
+	mkdir -p $@
+
+$(BUILD_DIR)/wpa3:
 	mkdir -p $@
 
 $(OUT_DIR):
@@ -333,6 +353,7 @@ AIRPORT_OUT_BIN   := $(AIRPORT_OUT_KEXT)/Contents/MacOS/RTL88WiFi
 
 AIRPORT_KEXT_SRCS := \
     $(KEXT_SRC)/RTW88IEEE80211.cpp \
+    $(KEXT_SRC)/RTW88WPA3Crypto.cpp \
     $(KEXT_SRC)/RTW88HwOps.cpp \
     $(KEXT_SRC)/RTL88WiFi.cpp \
     $(KEXT_SRC)/RTL88WiFiAWDL.cpp \
@@ -343,7 +364,7 @@ AIRPORT_KEXT_OBJS := $(patsubst $(KEXT_SRC)/%.cpp, $(BUILD_DIR)/airport/%.o, $(A
 
 AIRPORT_KMOD_OBJ := $(BUILD_DIR)/airport/kmod_info.o
 
-AIRPORT_ALL_OBJS := $(DRIVER_OBJS) $(CHIP_OBJS) $(COMPAT_OBJS) $(FIRMWARE_OBJS) $(AIRPORT_KMOD_OBJ) $(AIRPORT_KEXT_OBJS)
+AIRPORT_ALL_OBJS := $(DRIVER_OBJS) $(CHIP_OBJS) $(COMPAT_OBJS) $(FIRMWARE_OBJS) $(AIRPORT_KMOD_OBJ) $(AIRPORT_KEXT_OBJS) $(WPA3_SAE_ARCHIVE)
 
 AIRPORT_LDFLAGS := \
     $(ARCH) -static -nostdlib -Xlinker -kext \
@@ -360,6 +381,11 @@ $(AIRPORT_OUT_BIN): $(AIRPORT_ALL_OBJS) $(AIRPORT_KEXT_SKEL)/Contents/Info.plist
 	rsync -a --exclude='MacOS' $(AIRPORT_KEXT_SKEL)/ $(AIRPORT_OUT_KEXT)/
 	@echo "  OK   build/out/RTL88WiFi.kext"
 
+# The WPA3 CCM implementation must remain scalar in the kernel build.
+$(BUILD_DIR)/airport/RTW88WPA3Crypto.o: $(KEXT_SRC)/RTW88WPA3Crypto.cpp | $(BUILD_DIR)/airport
+	@echo "  CXX  RTW88WPA3Crypto.cpp (scalar kernel crypto)"
+	$(CXX) $(KEXT_CXXFLAGS) -D__IO80211_TARGET=__MAC_13_0 -DUSE_APPLE_SUPPLICANT=1 -D__PRIVATE_SPI__ -O2 -fno-vectorize -fno-slp-vectorize -mno-sse -mno-sse2 -mno-avx -c $< -o $@
+
 $(BUILD_DIR)/airport/%.o: $(KEXT_SRC)/%.cpp | $(BUILD_DIR)/airport
 	@echo "  CXX  $(notdir $<)"
 	$(CXX) $(KEXT_CXXFLAGS) -D__IO80211_TARGET=__MAC_13_0 -DUSE_APPLE_SUPPLICANT=1 -D__PRIVATE_SPI__ -c $< -o $@
@@ -375,7 +401,9 @@ $(AIRPORT_OUT_KEXT)/Contents/MacOS:
 	mkdir -p $@
 
 # Rebuild objects when one of their headers changes.
-DEPFILES = $(ALL_OBJS:.o=.d) $(AIRPORT_KEXT_OBJS:.o=.d) $(AIRPORT_KMOD_OBJ:.o=.d)
+# ALL_OBJS also contains the SAE static archive (.a). Only compiler-generated
+# .d files are makefile includes; never try to parse librtw_sae.a as a depfile.
+DEPFILES = $(filter %.d,$(ALL_OBJS:.o=.d)) $(AIRPORT_KEXT_OBJS:.o=.d) $(AIRPORT_KMOD_OBJ:.o=.d)
 -include $(DEPFILES)
 
 # Compiler flags and ABI macros in this file affect every object.

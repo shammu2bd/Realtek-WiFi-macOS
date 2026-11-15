@@ -5,6 +5,7 @@ inputs. This is not a kernel transport or hardware test.
 """
 from pathlib import Path
 import subprocess, tempfile
+import shutil
 
 root=Path(__file__).resolve().parents[1]/'driver/RTL88WiFi'
 s=(root/'src/kext/RTW88IEEE80211.cpp').read_text()
@@ -58,14 +59,17 @@ public:
  uint8_t _pmk[32]={1},_ptk[64]={},_gtk[32]={},_anonce[32]={},_snonce[32]={},_replayCtr[8]={},_installedM3ReplayCtr[8]={},_ccmpTxPn[6]={},_macAddr[6]={1,2,3,4,5,6};
  ieee80211_key_conf *_ptkConf=nullptr,*_gtkConf=nullptr;
  bool _snonceValid=false,_m3KeysInstalled=false,_handshakePending=false,_associatedVisible=false,_eapolTxProtect=false;
+ bool _saeMode=false;
  unsigned _state=RTW88_STATE_HANDSHAKING;
  bool submitOK=true;int submissions=0,aggregationStarts=0;
  struct {uint8_t bssid[6]={7,8,9,10,11,12};uint32_t group_cipher=WLAN_CIPHER_SUITE_CCMP;} _targetBSS;
  bool installKey(ieee80211_key_conf**,bool,uint8_t,uint32_t,const uint8_t*,uint8_t);
  void handleEAPOL(const uint8_t*,uint32_t);
+ void wpa3Eapol(const uint8_t*,uint32_t) {}
  bool sendEAPOLKey(int,const uint8_t*,bool,bool,bool);
  bool txDataFrame(mbuf_t m){captured=*m;delete m;submissions++;return submitOK;}
  void startTxAggregation(){aggregationStarts++;}
+ void finishRoam(bool){} // no roam lifecycle is exercised by this WPA2 handshake harness
  ~RTW88IEEE80211(){free(_ptkConf);free(_gtkConf);}
 };
 '''
@@ -121,5 +125,6 @@ int main(){
 '''
 with tempfile.TemporaryDirectory(prefix='rtw88-handshake-') as td:
     p=Path(td);(p/'test.cpp').write_text(prefix+crypto+wire+main)
-    subprocess.run(['xcrun','clang++','-std=c++17','-fsanitize=address,undefined','-g',str(p/'test.cpp'),'-o',str(p/'test')],check=True)
+    compiler = ['xcrun', 'clang++'] if shutil.which('xcrun') else ['clang++']
+    subprocess.run(compiler + ['-std=c++17','-fsanitize=address,undefined','-g',str(p/'test.cpp'),'-o',str(p/'test')],check=True)
     subprocess.run([str(p/'test')],check=True)
