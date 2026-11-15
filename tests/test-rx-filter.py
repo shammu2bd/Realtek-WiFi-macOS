@@ -5,6 +5,7 @@ ASan/UBSan check malformed inputs. This is not a kernel or hardware test.
 """
 from pathlib import Path
 import subprocess, tempfile
+import shutil
 
 root=Path(__file__).resolve().parents[1]/'driver/RTL88WiFi'
 s=(root/'src/kext/RTW88IEEE80211.cpp').read_text()
@@ -47,7 +48,8 @@ struct Delivered{uint16_t type;std::vector<uint8_t> payload;};
 static std::vector<Delivered> out;static std::vector<uint32_t> eapol;
 class RTW88IEEE80211{
 public:
- bool _m3KeysInstalled=false,_externalPTKInstalled=false,_externalSupplicant=false,_rxCcmpIvSkipLogged=false;
+ bool _m3KeysInstalled=false,_externalPTKInstalled=false,_externalSupplicant=false,_rxCcmpIvSkipLogged=false,_saeMode=false;
+ bool wpa3RxData(sk_buff*) { return true; }
  uint32_t _rxUndecryptedProtected=0,_rxUnprotectedDropped=0,_rxNonSnapDropped=0,_rxAmsduSpoofDropped=0,_rxTrailerChecks=0;
  unsigned _state=RTW88_STATE_CONNECTED,_scanReturnState=0;
  struct{uint32_t cipher=WLAN_CIPHER_SUITE_CCMP,group_cipher=WLAN_CIPHER_SUITE_CCMP;}_targetBSS;
@@ -111,7 +113,8 @@ int main(){
 '''
 with tempfile.TemporaryDirectory(prefix='rtw88-rxfilter-') as td:
     p=Path(td);(p/'test.cpp').write_text(prefix+fn('void RTW88IEEE80211::deliverDataFrame(')+'\n'+fn('void RTW88IEEE80211::deAmsdu(')+main)
-    subprocess.run(['xcrun','clang++','-std=c++17','-fsanitize=address,undefined','-fno-sanitize-recover=all','-g',str(p/'test.cpp'),'-o',str(p/'test')],check=True)
+    compiler = ['xcrun', 'clang++'] if shutil.which('xcrun') else ['clang++']
+    subprocess.run(compiler + ['-std=c++17','-fsanitize=address,undefined','-fno-sanitize-recover=all','-g',str(p/'test.cpp'),'-o',str(p/'test')],check=True)
     r=subprocess.run([str(p/'test')],capture_output=True,text=True)
     print('\n'.join(l for l in r.stdout.splitlines() if l.startswith('PASS') or 'trailer check' in l))
     if r.returncode: print(r.stdout[-2000:],r.stderr[-3000:]); raise SystemExit(r.returncode)

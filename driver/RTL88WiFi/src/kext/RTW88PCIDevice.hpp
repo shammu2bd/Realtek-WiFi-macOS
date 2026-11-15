@@ -80,6 +80,7 @@ public:
     /* Resume a flow-control-stalled output queue once the IRQ bottom-half has
      * freed BE ring slots.  Called via a C trampoline from the compat layer. */
     void resumeTxIfStalled() override;
+    void resumeTxAfterScanWindow() override { resumeTxIfStalled(); }
 
     /* Called from RTW88IEEE80211 to deliver RX frames to macOS */
     void injectRxFrame(mbuf_t m) override;

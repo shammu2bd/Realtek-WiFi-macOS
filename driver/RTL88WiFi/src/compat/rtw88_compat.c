@@ -1648,6 +1648,40 @@ bool rtw88_get_tx_rate(struct rtw88_tx_rate *out)
     return true;
 }
 
+bool rtw88_reset_sta_rate_adaptation(void)
+{
+    struct ieee80211_hw *hw = g_rtw88_hw;
+    struct rtw_dev *rtwdev;
+    struct ieee80211_sta *sta;
+    struct rtw_sta_info *si;
+    bool reset = false;
+
+    if (!hw || !hw->priv) return false;
+    rtwdev = (struct rtw_dev *)hw->priv;
+
+    /* Serialize station lookup and the RA update with the same device mutex
+     * used by rtw_sta_rc_work()/rtw_sta_add(). Avoid dereferencing the global
+     * station pointer before acquiring the lock. */
+    mutex_lock(&rtwdev->mutex);
+    sta = __atomic_load_n(&g_rtw88_sta, __ATOMIC_SEQ_CST);
+    if (sta) {
+        si = (struct rtw_sta_info *)sta->drv_priv;
+        if (si && si->rtwdev == rtwdev && si->sta == sta &&
+            si->vht_enable && si->bw_mode >= RTW_CHANNEL_WIDTH_40) {
+            /* This resends the already-negotiated peer RA mask. It does not
+             * set fix_rate or select a fixed MCS/NSS/bandwidth. */
+            rtw_update_sta_info(rtwdev, si, true);
+            reset = true;
+            rtw88_candidate_log(
+                "rtw88: mesh RA reseed rate_id=%u bw=%u vht=%u rssi_level=%u mask=0x%016llx\n",
+                si->rate_id, (unsigned)si->bw_mode, si->vht_enable ? 1U : 0U,
+                si->rssi_level, (unsigned long long)si->ra_mask);
+        }
+    }
+    mutex_unlock(&rtwdev->mutex);
+    return reset;
+}
+
 bool rtw88_get_rx_snr(int *snr_db)
 {
     /* rx.c feeds ewma_snr only for frames of our BSS (beacons and frames to

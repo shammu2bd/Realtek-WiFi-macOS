@@ -606,7 +606,8 @@ UInt32 RTW88PCIDevice::outputPacket(mbuf_t m, void *param)
      * after tx_isr frees slots) re-services the queue.  Threshold leaves
      * headroom so rtw_tx never actually hits -ENOSPC.
      */
-    if (rtw88_be_tx_avail() < kRTW88TxStallAvail) {
+    if (_ieee80211->staTxBlockedByConnectedScan() ||
+        rtw88_be_tx_avail() < kRTW88TxStallAvail) {
         _txStalled = true;
         return kIOReturnOutputStall;
     }
