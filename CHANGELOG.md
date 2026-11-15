@@ -28,7 +28,8 @@ This release adds bounded Neighbor Report discovery and AP-triggered BSS Transit
 
 - `tests/test-rrm-btm.py` compiles the production bounded wire helpers and passes parser, dialog-token, action-frame-address, BTM response and PMF receipt tests. Source checks cover the capability advertisement, directed scan and TX-ACK-gated handoff.
 - Targeted existing mesh, scan, WPA3, association, handshake, RX-filter, private-MAC, join-report and queue-backpressure host tests passed in this environment.
-- No native Xcode/macOS kext build or real AP/hardware test was possible in the Linux environment. The target RTL8821CE must be rebuilt and tested before installation.
+- A native build was subsequently completed on the target Intel Mac: `CFBundleVersion` reports `1.0.13`, the executable is a Mach-O 64-bit `x86_64` kext binary, and `plutil -lint` passes. The user reports that the installed kext is functioning. The built bundle is unsigned (not Developer ID signed or notarized); installation depends on a compatible existing boot/kext-loading configuration.
+- Real 802.11k Neighbor Report and 802.11v BTM exchanges with an access point, plus UniFi mesh roaming behavior, have not yet been tested. The user plans to test mesh roaming separately.
 - The initial BTM implementation scans only one preferred candidate channel per request. If no fresh secure candidate is seen, it declines and stays on the current AP. This is intentional rather than accepting an unverified BSSID.
 
 ---
