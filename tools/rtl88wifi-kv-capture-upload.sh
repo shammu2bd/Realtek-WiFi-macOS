@@ -146,7 +146,7 @@ if bad:
     print("Privacy audit failed; nothing was uploaded:")
     print("\n".join(" - " + x for x in bad))
     raise SystemExit(3)
-print("Privacy audit passed for all Gist files.")
+print("Privacy audit passed for all redacted capture files.")
 PY_AUDIT
 
 HASH="$(shasum -a 256 "$ZIP_FILE" | awk '{print $1}')"
@@ -188,7 +188,7 @@ EOF_META
 )
 
 CAPTURE_URL="https://github.com/$DIAGNOSTICS_REPO/tree/main/$DEST_REL"
-printf '%s\\n' "$CAPTURE_URL" > "$OUTDIR/private-repository-url.txt"
+printf '%s\n' "$CAPTURE_URL" > "$OUTDIR/private-repository-url.txt"
 echo
 echo "UPLOAD SUCCESS"
 echo "Private repository: $CAPTURE_URL"
