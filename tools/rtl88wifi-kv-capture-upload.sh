@@ -38,8 +38,7 @@ gh auth status >/dev/null 2>&1 || fail "GitHub CLI is not authenticated. Run gh 
 REGISTRY="$(ioreg -r -c RTL88WiFi -l -w0 2>/dev/null || true)"
 BUILD="$(printf '%s\n' "$REGISTRY" | sed -n -E 's/.*"DriverBuild" = "([^"]*)".*/\1/p' | head -1)"
 [ -n "$BUILD" ] || fail "RTL88WiFi has no DriverBuild registry property; is the kext loaded?"
-case "$BUILD" in *rtl88wifi*) ;; *) fail "Unexpected driver build string: $BUILD" ;; esac
-case "$BUILD" in *1.0.13*) ;; *) fail "Loaded DriverBuild does not identify 1.0.13: $BUILD" ;; esac
+[ "$BUILD" = "1.0.13" ] || fail "Loaded DriverBuild is not 1.0.13: $BUILD"
 
 LOADED_LINE="$(kmutil showloaded 2>/dev/null | grep -i 'io.github.x1ren41l.RTL88WiFi' | head -1 || true)"
 [ -n "$LOADED_LINE" ] || fail "kmutil does not show io.github.x1ren41l.RTL88WiFi as loaded."
@@ -66,7 +65,13 @@ old = "scan|roam|mesh ESS|mesh rate|mesh RA|DIAG sample=|TXSTATE|ADDBA|aggregati
 new = old + r"|802[.]11k|802[.]11v|neighbor|BTM|RRM"
 if s.count(old) != 1:
     raise SystemExit("Could not safely identify the existing scan-event filter; no capture started.")
-p.write_text(s.replace(old, new, 1))
+s = s.replace(old, new, 1)
+old_guard = 'case "$BUILD" in *rtl88wifi*) ;; *) echo "Unexpected driver build: $BUILD" >&2; exit 1 ;; esac'
+new_guard = '[ "$BUILD" = "1.0.13" ] || { echo "Unexpected driver build: $BUILD" >&2; exit 1; }'
+if s.count(old_guard) != 1:
+    raise SystemExit("Could not safely identify the generic collector DriverBuild guard.")
+s = s.replace(old_guard, new_guard, 1)
+p.write_text(s)
 PY_PATCH
 
 bash "$WORK/rtl88wifi-scanlog.sh" --duration "$DURATION" --interval "$INTERVAL" --output "$OUTDIR"
