@@ -1,8 +1,7 @@
 #!/bin/bash
 # Read-only RTL88WiFi 1.0.13 mesh / 802.11k / 802.11v diagnostic capture.
-# Produces a privacy-redacted capture and uploads selected TEXT files to a
-# secret (unlisted) GitHub Gist using the user's existing gh authentication.
-# A secret Gist is readable by anyone who has its URL; do not treat it as private.
+# Produces a privacy-redacted capture and pushes selected TEXT files and the
+# redacted ZIP to the user's PRIVATE RTL88WiFi-Diagnostics repository via gh.
 
 set -euo pipefail
 
@@ -153,25 +152,45 @@ PY_AUDIT
 HASH="$(shasum -a 256 "$ZIP_FILE" | awk '{print $1}')"
 printf 'ZIP SHA-256: %s\n' "$HASH" > "$CAPTURE_DIR/zip-sha256.txt"
 
-echo "Creating a SECRET (unlisted) GitHub Gist with redacted text diagnostics..."
-GIST_URL="$(gh gist create \
-    --desc "Redacted RTL88WiFi 1.0.13 mesh, 802.11k Neighbor Report and 802.11v BTM capture ($STAMP)" \
-    "$CAPTURE_DIR/README.txt" \
-    "$CAPTURE_DIR/capture-summary.txt" \
-    "$CAPTURE_DIR/samples.csv" \
-    "$CAPTURE_DIR/scan-events.log" \
-    "$CAPTURE_DIR/join-report.txt" \
-    "$CAPTURE_DIR/k-v-roaming-index.txt" \
-    "$CAPTURE_DIR/zip-sha256.txt")"
+DIAGNOSTICS_REPO="shammu2bd/RTL88WiFi-Diagnostics"
+VISIBILITY="$(gh repo view "$DIAGNOSTICS_REPO" --json visibility -q '.visibility' 2>/dev/null || true)"
+[ "$VISIBILITY" = "PRIVATE" ] || fail "Diagnostics repository is not accessible as a PRIVATE repository: $DIAGNOSTICS_REPO"
 
-case "$GIST_URL" in
-    https://gist.github.com/*) ;;
-    *) fail "Gist upload did not return a recognized URL. Local ZIP: $ZIP_FILE. Output: $GIST_URL" ;;
-esac
+echo "Uploading redacted diagnostics to PRIVATE repository $DIAGNOSTICS_REPO ..."
+DIAG_CLONE="$WORK/diagnostics-repo"
+gh repo clone "$DIAGNOSTICS_REPO" "$DIAG_CLONE"
 
-printf '%s\n' "$GIST_URL" > "$OUTDIR/gist-url.txt"
+DEST_REL="captures/kv-btm-$STAMP"
+DEST_DIR="$DIAG_CLONE/$DEST_REL"
+mkdir -p "$DEST_DIR"
+
+for f in README.txt capture-summary.txt samples.csv scan-events.log join-report.txt k-v-roaming-index.txt zip-sha256.txt; do
+    cp "$CAPTURE_DIR/$f" "$DEST_DIR/$f"
+done
+cp "$ZIP_FILE" "$DEST_DIR/RTL88WiFi-scanlog-$STAMP.zip"
+
+cat > "$DEST_DIR/upload-metadata.txt" <<EOF_META
+DriverBuild: $BUILD
+Capture started: $STAMP
+Duration seconds: $DURATION
+Sampling interval seconds: $INTERVAL
+Archive SHA-256: $HASH
+Privacy audit: passed
+EOF_META
+
+(
+    cd "$DIAG_CLONE"
+    git add "$DEST_REL"
+    git -c user.name="RTL88WiFi Diagnostic Uploader" \
+        -c user.email="diagnostics-uploader@users.noreply.github.com" \
+        commit -m "Add RTL88WiFi 1.0.13 diagnostic capture $STAMP"
+    git push origin HEAD:main
+)
+
+CAPTURE_URL="https://github.com/$DIAGNOSTICS_REPO/tree/main/$DEST_REL"
+printf '%s\\n' "$CAPTURE_URL" > "$OUTDIR/private-repository-url.txt"
 echo
 echo "UPLOAD SUCCESS"
-echo "Secret Gist: $GIST_URL"
+echo "Private repository: $CAPTURE_URL"
 echo "Local ZIP: $ZIP_FILE"
-echo "The Gist is unlisted, not access-restricted. Anyone with its URL can read it."
+echo "Repository visibility: PRIVATE"
