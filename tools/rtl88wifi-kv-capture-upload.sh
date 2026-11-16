@@ -9,7 +9,6 @@ set -euo pipefail
 DURATION="${1:-600}"
 INTERVAL="${2:-2}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCANLOG="$SCRIPT_DIR/rtl88wifi-scanlog.sh"
 JOINREPORT="$SCRIPT_DIR/rtl88wifi-join-report.sh"
 OUTROOT="$HOME/Documents/RTL88WiFi-ScanLogs"
@@ -64,7 +63,7 @@ import sys
 p = Path(sys.argv[1])
 s = p.read_text()
 old = "scan|roam|mesh ESS|mesh rate|mesh RA|DIAG sample=|TXSTATE|ADDBA|aggregation|ASSOCIATE|AUTH|deauth|disassoc|beacon"
-new = old + r"|802\\.11k|802\\.11v|neighbor|BTM|RRM"
+new = old + r"|802[.]11k|802[.]11v|neighbor|BTM|RRM"
 if s.count(old) != 1:
     raise SystemExit("Could not safely identify the existing scan-event filter; no capture started.")
 p.write_text(s.replace(old, new, 1))
@@ -92,20 +91,20 @@ count_matches() {
 {
     echo "RTL88WiFi 1.0.13 K/V/mesh event index"
     echo "DriverBuild: $BUILD"
-    echo "Neighbor Report request submitted: $(count_matches '802\\.11k neighbor request submitted' "$CAPTURE_DIR/scan-events.log")"
-    echo "Neighbor Report response accepted: $(count_matches '802\\.11k neighbor response accepted' "$CAPTURE_DIR/scan-events.log")"
-    echo "Neighbor Report response rejected: $(count_matches '802\\.11k neighbor response rejected' "$CAPTURE_DIR/scan-events.log")"
-    echo "Neighbor Report timeout: $(count_matches '802\\.11k neighbor response timed out' "$CAPTURE_DIR/scan-events.log")"
-    echo "BTM requests queued: $(count_matches '802\\.11v BTM request queued' "$CAPTURE_DIR/scan-events.log")"
-    echo "BTM accepted: $(count_matches '802\\.11v BTM accept submitted' "$CAPTURE_DIR/scan-events.log")"
-    echo "BTM acknowledged roam handoffs: $(count_matches '802\\.11v BTM acknowledged; roam handoff submitted' "$CAPTURE_DIR/scan-events.log")"
-    echo "BTM rejections: $(count_matches '802\\.11v BTM rejected' "$CAPTURE_DIR/scan-events.log")"
+    echo "Neighbor Report request submitted: $(count_matches '802[.]11k neighbor request submitted' "$CAPTURE_DIR/scan-events.log")"
+    echo "Neighbor Report response accepted: $(count_matches '802[.]11k neighbor response accepted' "$CAPTURE_DIR/scan-events.log")"
+    echo "Neighbor Report response rejected: $(count_matches '802[.]11k neighbor response rejected' "$CAPTURE_DIR/scan-events.log")"
+    echo "Neighbor Report timeout: $(count_matches '802[.]11k neighbor response timed out' "$CAPTURE_DIR/scan-events.log")"
+    echo "BTM requests queued: $(count_matches '802[.]11v BTM request queued' "$CAPTURE_DIR/scan-events.log")"
+    echo "BTM accepted: $(count_matches '802[.]11v BTM accept submitted' "$CAPTURE_DIR/scan-events.log")"
+    echo "BTM acknowledged roam handoffs: $(count_matches '802[.]11v BTM acknowledged; roam handoff submitted' "$CAPTURE_DIR/scan-events.log")"
+    echo "BTM rejections: $(count_matches '802[.]11v BTM rejected' "$CAPTURE_DIR/scan-events.log")"
     echo "Mesh roam starts: $(count_matches 'mesh roam start' "$CAPTURE_DIR/scan-events.log")"
     echo "Mesh roam completions: $(count_matches 'mesh roam complete' "$CAPTURE_DIR/scan-events.log")"
     echo "Mesh roam failures: $(count_matches 'mesh roam failed' "$CAPTURE_DIR/scan-events.log")"
     echo
     echo "Matching event lines:"
-    grep -Ei '802\\.11k|802\\.11v|neighbor|BTM|mesh roam (start|complete|failed)' "$CAPTURE_DIR/scan-events.log" || true
+    grep -Ei '802[.]11k|802[.]11v|neighbor|BTM|mesh roam (start|complete|failed)' "$CAPTURE_DIR/scan-events.log" || true
 } > "$CAPTURE_DIR/k-v-roaming-index.txt"
 
 # Fail closed if any obvious unredacted network identifiers or key values remain.
@@ -118,17 +117,27 @@ names = [
     "scan-events.log", "join-report.txt", "k-v-roaming-index.txt",
 ]
 mac = re.compile(r"(?i)(?:[0-9a-f]{2}:){5}[0-9a-f]{2}")
-ipv4 = re.compile(r"(?<![0-9])(?:[0-9]{1,3}\\.){3}[0-9]{1,3}(?![0-9])")
-ssid = re.compile(r"(?i)\\bssid=(?!\\[SSID-redacted\\]|\\[hidden\\])[^\\r\\n]+")
-secret = re.compile(r"(?i)\\b(password|passphrase|psk|pmk|ptk|gtk|igtk|pmkid|key_data)\\s*=\\s*(?!\\[secret-redacted\\])[^,;\\s]+")
+ipv4 = re.compile(r"(?<![0-9])(?:[0-9]{1,3}[.]){3}[0-9]{1,3}(?![0-9])")
+key_assignment = re.compile(r"(?i)(password|passphrase|psk|pmk|ptk|gtk|igtk|pmkid|key_data)=")
 bad = []
 for name in names:
-    p = root / name
-    text = p.read_text(errors="replace")
-    if mac.search(text): bad.append(f"{name}: possible raw MAC/BSSID")
-    if ipv4.search(text): bad.append(f"{name}: possible raw IPv4 address")
-    if ssid.search(text): bad.append(f"{name}: possible unredacted SSID")
-    if secret.search(text): bad.append(f"{name}: possible unredacted key-like value")
+    text = (root / name).read_text(errors="replace")
+    if mac.search(text):
+        bad.append(f"{name}: possible raw MAC/BSSID")
+    if ipv4.search(text):
+        bad.append(f"{name}: possible raw IPv4 address")
+    for line in text.splitlines():
+        low = line.lower()
+        if "ssid=" in low:
+            ssid_value = low.split("ssid=", 1)[1].split(" ", 1)[0]
+            if not (ssid_value.startswith("[ssid-redacted]") or ssid_value.startswith("[hidden]")):
+                bad.append(f"{name}: possible unredacted SSID")
+                break
+    for match in key_assignment.finditer(text):
+        value = text[match.end():].split()[0] if text[match.end():].split() else ""
+        if value != "[secret-redacted]":
+            bad.append(f"{name}: possible unredacted key-like value")
+            break
 if bad:
     print("Privacy audit failed; nothing was uploaded:")
     print("\n".join(" - " + x for x in bad))
